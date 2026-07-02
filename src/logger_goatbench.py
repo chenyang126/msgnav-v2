@@ -141,6 +141,32 @@ class Logger:
         self.end_ratio = end_ratio
         self.split = split
 
+        # ---- per-split live debug records (JSONL detail + CSV summary) ----
+        # each parallel worker (identified by split/specific) writes its own files to
+        # avoid write contention; summarize_results.py merges them into a global view.
+        _tag = f"{start_ratio}_{end_ratio}_{split}"
+        if specific is not None:
+            _tag = f"{_tag}_{specific}"
+        try:
+            from src.const import API_MODE, GPT_MODEL, Qwen_MODEL
+            self.model_name = GPT_MODEL if API_MODE == "gpt" else Qwen_MODEL
+        except Exception:
+            self.model_name = "unknown"
+        self.records_jsonl_path = os.path.join(output_dir, f"records_{_tag}.jsonl")
+        self.records_csv_path = os.path.join(output_dir, f"records_{_tag}.csv")
+        self.trajectory_jsonl_path = os.path.join(output_dir, f"trajectory_{_tag}.jsonl")
+        self.trajectory_records = []
+        self.current_trajectory_meta = {}
+        # accumulate all record dicts of this worker so we can rewrite the csv each time
+        self._records = []
+        self._csv_fields = [
+            "timestamp", "model", "subtask_id", "scene", "episode", "subtask_idx",
+            "task_type", "question", "gt_answer", "success", "spl",
+            "agent_explore_dist", "gt_explore_dist", "success_distance_thresh",
+            "final_distance_to_goal", "n_steps", "n_filtered_frames", "n_total_frames",
+            "goal_obj_ids", "note",
+        ]
+
         # some sanity check
         assert (
             len(self.success_by_distance)
@@ -280,6 +306,13 @@ class Logger:
         goal_type: str,
         n_filtered_frames,
         n_total_frames,
+        question: str = "",
+        gt_answer: str = "",
+        final_distance_to_goal: float = None,
+        success_distance_thresh: float = None,
+        n_steps: int = None,
+        goal_obj_ids=None,
+        note: str = "",
     ):
         if success_by_distance:
             self.success_by_distance[subtask_id] = 1.0
@@ -324,10 +357,193 @@ class Logger:
         self.n_filtered_frames_list[subtask_id] = n_filtered_frames
         self.n_total_frames_list[subtask_id] = n_total_frames
 
+        # ---- write live debug record (JSONL append + CSV rewrite) ----
+        self._write_live_record(
+            subtask_id=subtask_id,
+            goal_type=goal_type,
+            gt_subtask_explore_dist=gt_subtask_explore_dist,
+            n_filtered_frames=n_filtered_frames,
+            n_total_frames=n_total_frames,
+            question=question,
+            gt_answer=gt_answer,
+            final_distance_to_goal=final_distance_to_goal,
+            success_distance_thresh=success_distance_thresh,
+            n_steps=n_steps,
+            goal_obj_ids=goal_obj_ids,
+            note=note,
+        )
+
         # clear the subtask logging
         self.subtask_object_observe_dir = None
         self.pts_voxels = np.empty((0, 2))
         self.subtask_explore_dist = 0.0
+
+    def _write_live_record(
+        self,
+        subtask_id,
+        goal_type,
+        gt_subtask_explore_dist,
+        n_filtered_frames,
+        n_total_frames,
+        question="",
+        gt_answer="",
+        final_distance_to_goal=None,
+        success_distance_thresh=None,
+        n_steps=None,
+        goal_obj_ids=None,
+        note="",
+    ):
+        """Append one subtask record to JSONL and rewrite the summary CSV.
+
+        Robust to any error so it never breaks the evaluation loop.
+        """
+        import csv
+        import datetime
+        import traceback
+
+        try:
+            parts = subtask_id.split("_")
+            scene = parts[0] if len(parts) > 0 else ""
+            episode = parts[1] if len(parts) > 1 else ""
+            subtask_idx = parts[2] if len(parts) > 2 else ""
+
+            def _num(x):
+                try:
+                    if x is None:
+                        return None
+                    v = float(x)
+                    return None if math.isnan(v) else round(v, 6)
+                except Exception:
+                    return None
+
+            record = {
+                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                "model": self.model_name,
+                "subtask_id": subtask_id,
+                "scene": scene,
+                "episode": episode,
+                "subtask_idx": subtask_idx,
+                "task_type": goal_type,
+                "question": question,
+                "gt_answer": gt_answer,
+                "success": self.success_by_distance.get(subtask_id),
+                "spl": _num(self.spl_by_distance.get(subtask_id)),
+                "agent_explore_dist": _num(self.subtask_explore_dist),
+                "gt_explore_dist": _num(gt_subtask_explore_dist),
+                "success_distance_thresh": _num(success_distance_thresh),
+                "final_distance_to_goal": _num(final_distance_to_goal),
+                "n_steps": n_steps,
+                "n_filtered_frames": n_filtered_frames,
+                "n_total_frames": n_total_frames,
+                "goal_obj_ids": goal_obj_ids,
+                "note": note,
+            }
+
+            # append to JSONL (one line per subtask, full detail)
+            with open(self.records_jsonl_path, "a") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+            # keep in-memory list and rewrite the flat CSV
+            self._records.append(record)
+            with open(self.records_csv_path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=self._csv_fields, extrasaction="ignore")
+                w.writeheader()
+                for r in self._records:
+                    row = dict(r)
+                    if isinstance(row.get("goal_obj_ids"), (list, tuple)):
+                        row["goal_obj_ids"] = ";".join(str(x) for x in row["goal_obj_ids"])
+                    w.writerow(row)
+        except Exception:
+            logging.warning(
+                "Failed to write live record for %s:\n%s",
+                subtask_id,
+                traceback.format_exc(),
+            )
+    def _json_safe(self, value):
+        """Convert common numpy/map objects into JSON-serializable values."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            if isinstance(value, float) and math.isnan(value):
+                return None
+            return value
+        if isinstance(value, np.generic):
+            return self._json_safe(value.item())
+        if isinstance(value, np.ndarray):
+            return self._json_safe(value.tolist())
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): self._json_safe(v) for k, v in value.items()}
+        if isinstance(value, Frontier):
+            return {
+                "position": self._json_safe(getattr(value, "position", None)),
+                "orientation": self._json_safe(getattr(value, "orientation", None)),
+                "image": getattr(value, "image", None),
+            }
+        if hasattr(value, "center"):
+            return self._json_safe(value.center)
+        return str(value)
+
+    def init_trajectory_logging(self, subtask_id, metadata=None):
+        """Initialize lightweight per-step trajectory logging for one subtask."""
+        self.trajectory_records = []
+        self.current_trajectory_meta = {
+            "subtask_id": subtask_id,
+            **self._json_safe(metadata or {}),
+        }
+
+    def log_step_trajectory(self, step_record):
+        """Append one JSON-safe step record for later failure analysis."""
+        try:
+            self.trajectory_records.append(self._json_safe(step_record))
+        except Exception:
+            logging.exception("Failed to append trajectory step record")
+
+    def log_event(self, event_type, step=None, payload=None):
+        """Attach an event to the current step, or append a standalone event step."""
+        event = {
+            "event": event_type,
+            "step": step,
+            "payload": self._json_safe(payload or {}),
+        }
+        try:
+            if self.trajectory_records and (
+                step is None or self.trajectory_records[-1].get("step") == step
+            ):
+                self.trajectory_records[-1].setdefault("events", []).append(event)
+            else:
+                self.trajectory_records.append({"step": step, "events": [event]})
+        except Exception:
+            logging.exception("Failed to append trajectory event")
+
+    def save_trajectory_jsonl(self, subtask_id, final_summary=None):
+        """Append one subtask trajectory record to JSONL.
+
+        Robust to serialization errors so trajectory logging never breaks evaluation.
+        """
+        import datetime
+        import traceback
+
+        try:
+            record = {
+                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                "subtask_id": subtask_id,
+                "metadata": self._json_safe(self.current_trajectory_meta),
+                "total_steps": len(self.trajectory_records),
+                "trajectory": self._json_safe(self.trajectory_records),
+                "final_summary": self._json_safe(final_summary or {}),
+            }
+            with open(self.trajectory_jsonl_path, "a") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            logging.warning(
+                "Failed to write trajectory record for %s:\n%s",
+                subtask_id,
+                traceback.format_exc(),
+            )
+        finally:
+            self.trajectory_records = []
+            self.current_trajectory_meta = {}
+
 
     def init_episode(
         self,

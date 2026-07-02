@@ -105,6 +105,84 @@ class Timer:
             logging.info(f" {idx} {module}: average {avg_time:.6f} s")
 
 
+def _summarize_frontiers(tsdf_planner, chosen_frontier=None):
+    frontiers = []
+    for idx, frontier in enumerate(tsdf_planner.frontiers):
+        frontiers.append(
+            {
+                "id": idx,
+                "position": getattr(frontier, "position", None),
+                "orientation": getattr(frontier, "orientation", None),
+                "image": getattr(frontier, "image", None),
+                "chosen": chosen_frontier is not None and frontier is chosen_frontier,
+            }
+        )
+    return frontiers
+
+
+def _summarize_objects(scene):
+    objects = []
+    for obj_id, obj in scene.objects.items():
+        bbox = obj.get("bbox")
+        pcd = obj.get("pcd")
+        try:
+            num_points = len(pcd.points) if pcd is not None else None
+        except Exception:
+            num_points = None
+        objects.append(
+            {
+                "id": obj_id,
+                "class_name": obj.get("class_name"),
+                "room_label": obj.get("room_label"),
+                "room_conf": obj.get("room_conf"),
+                "bbox_center": getattr(bbox, "center", None),
+                "num_points": num_points,
+            }
+        )
+    return objects
+
+
+def _planner_point_summary(tsdf_planner):
+    return {
+        "max_point": tsdf_planner.max_point,
+        "target_point": tsdf_planner.target_point,
+        "target_type": getattr(tsdf_planner, "target_type", None),
+    }
+
+
+def _safe_goal_distance(pts, viewpoints, pathfinder):
+    try:
+        return calc_agent_subtask_distance(pts, viewpoints, pathfinder)
+    except Exception as exc:
+        logging.warning(f"Failed to calculate trajectory goal distance: {exc}")
+        return None
+
+
+def _finish_step_trajectory(
+    logger,
+    step_log,
+    pts_after,
+    angle_after,
+    scene,
+    tsdf_planner,
+    subtask_metadata,
+    target_arrived=None,
+):
+    step_log.update(
+        {
+            "pts_after": pts_after,
+            "angle_after": angle_after,
+            "target_arrived": target_arrived,
+            "explore_dist": logger.subtask_explore_dist,
+            "dist_to_gt_viewpoint": _safe_goal_distance(
+                pts_after, subtask_metadata["viewpoints"], scene.pathfinder
+            ),
+            "planner_after": _planner_point_summary(tsdf_planner),
+        }
+    )
+    logger.log_step_trajectory(step_log)
+
+
 def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
     # load the default concept graph config
     cfg_cg = OmegaConf.load(cfg.concept_graph_config_path)
@@ -258,6 +336,20 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                     scene=scene,
                     tsdf_planner=tsdf_planner,
                 )
+                logger.init_trajectory_logging(
+                    subtask_id,
+                    metadata={
+                        "scene_id": scene_id,
+                        "episode_id": episode_id,
+                        "subtask_idx": subtask_idx,
+                        "question": subtask_metadata.get("question"),
+                        "task_type": subtask_metadata.get("task_type"),
+                        "class": subtask_metadata.get("class"),
+                        "goal_obj_ids": subtask_metadata.get("goal_obj_ids"),
+                        "gt_subtask_explore_dist": subtask_metadata.get("gt_subtask_explore_dist"),
+                        "num_step": num_step,
+                    },
+                )
 
                 # mapping from the obj id in habitat to the id assigned by concept graph
                 # this mapping/alignment is done by heuristic matching between object masks
@@ -269,6 +361,7 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                 task_success = False
                 task_check_obs = []
                 cnt_step = -1
+                n_filtered_frames = 0
                 his_decision = {}
                 subtask_metadata['CLR'] = his_decision
                 # reset tsdf planner
@@ -293,6 +386,21 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
 
                     cnt_step += 1
                     global_step += 1
+                    pts_before = pts.copy()
+                    angle_before = angle
+                    step_log = {
+                        "step": cnt_step,
+                        "global_step": global_step,
+                        "pts_before": pts_before,
+                        "angle_before": angle_before,
+                        "events": [],
+                        "vlm_called": False,
+                        "planner_had_target_before_query": (
+                            tsdf_planner.max_point is not None
+                            or tsdf_planner.target_point is not None
+                        ),
+                        "planner_before": _planner_point_summary(tsdf_planner),
+                    }
                     his_decision['cnt_step'] = cnt_step
                     his_decision['max_step'] = num_step
                     logging.info(
@@ -411,6 +519,14 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                     )
                     if not update_success:
                         logging.info("Warning! Update frontier map failed!")
+                        step_log["events"].append({"event": "frontier_update_failed"})
+                    step_log.update(
+                        {
+                            "update_frontier_success": update_success,
+                            "frontier_count": len(tsdf_planner.frontiers),
+                            "frontiers": _summarize_frontiers(tsdf_planner),
+                        }
+                    )
                     timer.stop("Update Frontier")
 
 
@@ -434,15 +550,25 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         target_obj_ids_estimate.append(
                             max(set(det_ids), key=det_ids.count)
                         )
-                        #####For each obj_id, pick the detection ID that appears most often in its list of detections, 
+                        #####For each obj_id, pick the detection ID that appears most often in its list of detections,
                         #####and append that as the estimated target ID.
+                    step_log.update(
+                        {
+                            "object_count": len(scene.objects),
+                            "objects": _summarize_objects(scene),
+                            "added_object_ids": all_added_obj_ids,
+                            "goal_obj_ids_mapping": goal_obj_ids_mapping,
+                            "target_obj_ids_estimate": target_obj_ids_estimate,
+                        }
+                    )
 
                     if (
                         tsdf_planner.max_point is None
                         and tsdf_planner.target_point is None
                     ):
                         # query the VLM for the next navigation point, and the reason for the choice
-                        
+                        step_log["vlm_called"] = True
+
                         vlm_response = query_vlm_for_response(
                             subtask_metadata=subtask_metadata,
                             scene=scene,
@@ -457,11 +583,31 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             logging.info(
                                 f"Subtask id {subtask_id} invalid: query_vlm_for_response failed!"
                             )
+                            step_log["events"].append({"event": "vlm_response_none"})
+                            _finish_step_trajectory(
+                                logger,
+                                step_log,
+                                pts,
+                                angle,
+                                scene,
+                                tsdf_planner,
+                                subtask_metadata,
+                                target_arrived=False,
+                            )
                             break
 
                         target_type, max_point_choice, n_filtered_frames, target_index = vlm_response
                         decision['target_type'] = target_type
                         decision['max_point_choice'] = target_index
+                        step_log.update(
+                            {
+                                "target_type": target_type,
+                                "target_index": target_index,
+                                "n_filtered_frames": n_filtered_frames,
+                                "max_point_choice": max_point_choice,
+                                "decision": decision.copy(),
+                            }
+                        )
                         # set the vlm choice as the navigation target
                         update_success = tsdf_planner.set_next_navigation_point(
                             target_type = target_type, 
@@ -472,11 +618,40 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             cfg=cfg.planner,
                             pathfinder=scene.pathfinder,
                         )
+                        step_log.update(
+                            {
+                                "set_next_navigation_success": update_success,
+                                "planner_after_set_target": _planner_point_summary(tsdf_planner),
+                            }
+                        )
                         if not update_success:
                             logging.info(
                                 f"Subtask id {subtask_id} invalid: set_next_navigation_point failed!"
                             )
+                            step_log["events"].append(
+                                {"event": "set_next_navigation_failed"}
+                            )
+                            _finish_step_trajectory(
+                                logger,
+                                step_log,
+                                pts,
+                                angle,
+                                scene,
+                                tsdf_planner,
+                                subtask_metadata,
+                                target_arrived=False,
+                            )
                             break
+                    else:
+                        step_log.update(
+                            {
+                                "target_type": getattr(tsdf_planner, "target_type", None),
+                                "target_index": None,
+                                "n_filtered_frames": n_filtered_frames,
+                                "decision": decision.copy(),
+                                "set_next_navigation_success": None,
+                            }
+                        )
                     timer.stop("Querying the VLM")
 
                     timer.start("Planner navigate to the target point")
@@ -499,12 +674,30 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         logging.info(
                             f"Subtask id {subtask_id} invalid: agent_step failed!"
                         )
+                        step_log["agent_step_success"] = False
+                        step_log["agent_step_failure_reason"] = "agent_step_returned_none"
+                        step_log["events"].append({"event": "agent_step_failed"})
+                        _finish_step_trajectory(
+                            logger,
+                            step_log,
+                            pts,
+                            angle,
+                            scene,
+                            tsdf_planner,
+                            subtask_metadata,
+                            target_arrived=False,
+                        )
                         break
 
                     # update agent's position and rotation
                     pts, angle, pts_voxel, fig, _, target_arrived = return_values
-                    
-                    
+                    step_log.update(
+                        {
+                            "agent_step_success": True,
+                            "pts_voxel_after": pts_voxel,
+                        }
+                    )
+
                     logger.log_step(pts_voxel=pts_voxel)
                     logging.info(
                         f"Current position: {pts}, {logger.subtask_explore_dist:.3f}"
@@ -556,11 +749,43 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             verbose=True,
                         ) 
                         if (vlm_response == 'yes'):
+                            step_log["end_check_called"] = True
+                            step_log["end_check_response"] = vlm_response
+                            step_log["events"].append({"event": "end_check_yes"})
+                            his_decision[cnt_step] = decision
+                            _finish_step_trajectory(
+                                logger,
+                                step_log,
+                                pts,
+                                angle,
+                                scene,
+                                tsdf_planner,
+                                subtask_metadata,
+                                target_arrived=target_arrived,
+                            )
                             break
                         else:
                             decision['object_judge'] = "no"
+                            step_log["end_check_called"] = True
+                            step_log["end_check_response"] = vlm_response
+                            step_log["decision"] = decision.copy()
+                            step_log["events"].append({"event": "end_check_no"})
+                    else:
+                        step_log["end_check_called"] = False
 
                     his_decision[cnt_step] = decision
+                    step_log["decision"] = decision.copy()
+                    step_log["his_decision_step_keys"] = list(his_decision.keys())
+                    _finish_step_trajectory(
+                        logger,
+                        step_log,
+                        pts,
+                        angle,
+                        scene,
+                        tsdf_planner,
+                        subtask_metadata,
+                        target_arrived=target_arrived,
+                    )
 
                 # calculate the distance to the nearest view point
                 agent_subtask_distance = calc_agent_subtask_distance(
@@ -577,6 +802,19 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         f"Fail: agent failed to reach the target viewpoint at distance {agent_subtask_distance}!"
                     )
 
+                logger.save_trajectory_jsonl(
+                    subtask_id,
+                    final_summary={
+                        "success_by_distance": success_by_distance,
+                        "final_distance_to_goal": agent_subtask_distance,
+                        "success_distance": cfg.success_distance,
+                        "n_filtered_frames": n_filtered_frames,
+                        "n_total_frames": len(scene.img_to_edge),
+                        "n_steps": cnt_step + 1,
+                        "explore_dist": logger.subtask_explore_dist,
+                    },
+                )
+
                 logger.log_subtask_result(
                     success_by_distance=success_by_distance,
                     subtask_id=subtask_id,
@@ -584,6 +822,12 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                     goal_type=goal_type,
                     n_filtered_frames=n_filtered_frames,
                     n_total_frames=len(scene.img_to_edge),
+                    question=subtask_metadata.get("question", ""),
+                    gt_answer=subtask_metadata.get("class", ""),
+                    final_distance_to_goal=agent_subtask_distance,
+                    success_distance_thresh=cfg.success_distance,
+                    n_steps=cnt_step + 1,
+                    goal_obj_ids=subtask_metadata.get("goal_obj_ids", None),
                 )
 
                 logging.info(f"Scene graph of question {subtask_id}:")
@@ -624,7 +868,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
     cfg = OmegaConf.load(args.cfg_file)
     OmegaConf.resolve(cfg)
-    cfg.output_dir = os.path.join(cfg.output_parent_dir, cfg.exp_name)
+    # append the active model name to exp_name so results of different models are kept separate
+    from src.const import API_MODE, GPT_MODEL, Qwen_MODEL
+    _active_model = GPT_MODEL if API_MODE == "gpt" else Qwen_MODEL
+    _model_tag = str(_active_model).replace("/", "_").replace(":", "-")
+    cfg.output_dir = os.path.join(cfg.output_parent_dir, f"{cfg.exp_name}_{_model_tag}")
     
     # Set up logging
     

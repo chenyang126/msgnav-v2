@@ -91,7 +91,7 @@ def call_openai_api(sys_prompt, contents) -> Optional[str]:
         try:
             if mode == 'gpt':
                 completion = gpt_client.chat.completions.create(
-                    model="gpt-5.4",  # model = "deployment_name"
+                    model=GPT_MODEL,  # model = "deployment_name"
                     messages=message_text,
                     temperature=0.95,
                     max_tokens=4096,
@@ -99,7 +99,7 @@ def call_openai_api(sys_prompt, contents) -> Optional[str]:
                 )
             else:
                 completion = qwen_client.chat.completions.create(
-                    model="qwen-vl-max",  # model = "deployment_name"
+                    model=Qwen_MODEL,  # model = "deployment_name"
                     messages=message_text,
                     temperature=0.7,
                     max_tokens=4096,

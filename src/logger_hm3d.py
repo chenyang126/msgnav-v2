@@ -139,6 +139,14 @@ class Logger:
         self.start_ratio = start_ratio
         self.end_ratio = end_ratio
 
+        # Per-worker lightweight trajectory records for failure analysis.
+        _tag = f"{start_ratio}_{end_ratio}"
+        if specific is not None:
+            _tag = f"{_tag}_{specific}"
+        self.trajectory_jsonl_path = os.path.join(output_dir, f"trajectory_{_tag}.jsonl")
+        self.trajectory_records = []
+        self.current_trajectory_meta = {}
+
         # some sanity check
         assert (
             len(self.success_by_distance)
@@ -328,6 +336,91 @@ class Logger:
         self.subtask_object_observe_dir = None
         self.pts_voxels = np.empty((0, 2))
         self.subtask_explore_dist = 0.0
+
+    def _json_safe(self, value):
+        """Convert common numpy/map objects into JSON-serializable values."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            if isinstance(value, float) and math.isnan(value):
+                return None
+            return value
+        if isinstance(value, np.generic):
+            return self._json_safe(value.item())
+        if isinstance(value, np.ndarray):
+            return self._json_safe(value.tolist())
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe(v) for v in value]
+        if isinstance(value, dict):
+            return {str(k): self._json_safe(v) for k, v in value.items()}
+        if isinstance(value, Frontier):
+            return {
+                "position": self._json_safe(getattr(value, "position", None)),
+                "orientation": self._json_safe(getattr(value, "orientation", None)),
+                "image": getattr(value, "image", None),
+            }
+        if hasattr(value, "center"):
+            return self._json_safe(value.center)
+        return str(value)
+
+    def init_trajectory_logging(self, subtask_id, metadata=None):
+        """Initialize lightweight per-step trajectory logging for one episode/subtask."""
+        self.trajectory_records = []
+        self.current_trajectory_meta = {
+            "subtask_id": subtask_id,
+            **self._json_safe(metadata or {}),
+        }
+
+    def log_step_trajectory(self, step_record):
+        """Append one JSON-safe step record for later failure analysis."""
+        try:
+            self.trajectory_records.append(self._json_safe(step_record))
+        except Exception:
+            logging.exception("Failed to append trajectory step record")
+
+    def log_event(self, event_type, step=None, payload=None):
+        """Attach an event to the current step, or append a standalone event step."""
+        event = {
+            "event": event_type,
+            "step": step,
+            "payload": self._json_safe(payload or {}),
+        }
+        try:
+            if self.trajectory_records and (
+                step is None or self.trajectory_records[-1].get("step") == step
+            ):
+                self.trajectory_records[-1].setdefault("events", []).append(event)
+            else:
+                self.trajectory_records.append({"step": step, "events": [event]})
+        except Exception:
+            logging.exception("Failed to append trajectory event")
+
+    def save_trajectory_jsonl(self, subtask_id, final_summary=None):
+        """Append one episode/subtask trajectory record to JSONL.
+
+        Robust to serialization errors so trajectory logging never breaks evaluation.
+        """
+        import datetime
+        import traceback
+
+        try:
+            record = {
+                "timestamp": datetime.datetime.now().isoformat(timespec="seconds"),
+                "subtask_id": subtask_id,
+                "metadata": self._json_safe(self.current_trajectory_meta),
+                "total_steps": len(self.trajectory_records),
+                "trajectory": self._json_safe(self.trajectory_records),
+                "final_summary": self._json_safe(final_summary or {}),
+            }
+            with open(self.trajectory_jsonl_path, "a") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            logging.warning(
+                "Failed to write trajectory record for %s:\n%s",
+                subtask_id,
+                traceback.format_exc(),
+            )
+        finally:
+            self.trajectory_records = []
+            self.current_trajectory_meta = {}
 
     def init_episode(
         self,

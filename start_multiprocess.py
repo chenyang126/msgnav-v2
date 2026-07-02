@@ -23,7 +23,13 @@ def dynamic_scene_process(
     print(f"[worker-{worker_id}] start on cuda:{device_id}", flush=True)
     while True:
         try:
-            task_id = task_queue.get_nowait()
+            # Use a blocking get with timeout instead of get_nowait(): with
+            # multiprocessing.Queue the items are flushed to the underlying pipe
+            # by a background feeder thread, so a worker that starts before the
+            # flush completes would see a spurious Empty and exit early, wasting
+            # that GPU. A short timeout tolerates that startup window; once the
+            # queue is genuinely drained the timeout fires and the worker exits.
+            task_id = task_queue.get(timeout=5)
         except queue.Empty:
             break
 
@@ -119,7 +125,11 @@ if __name__ == "__main__":
     total_scenes = args.total_scenes
     splits = args.splits
 
-    task_queue = multiprocessing.Queue()
+    # Manager().Queue() has synchronous put semantics (no background feeder
+    # thread), so all task ids are guaranteed visible before workers start.
+    # This avoids the race where a fast-starting worker sees an empty queue.
+    manager = multiprocessing.Manager()
+    task_queue = manager.Queue()
     for i in range(total_scenes * splits):
         task_queue.put(i)
 
