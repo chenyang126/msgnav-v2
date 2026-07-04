@@ -49,6 +49,8 @@ def merge_records_jsonl(output_dir):
 
     records = []
     for path in sorted(glob.glob(os.path.join(output_dir, "records_*.jsonl"))):
+        if os.path.basename(path) == "records_all.jsonl":
+            continue
         try:
             with open(path) as f:
                 for line in f:

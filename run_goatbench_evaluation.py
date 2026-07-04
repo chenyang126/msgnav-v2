@@ -43,7 +43,7 @@ from src.tsdf_planner import TSDFPlanner, Frontier
 from src.multimodal_3d_scene_graph import Scene
 from src.utils import resize_image, calc_agent_subtask_distance, get_pts_angle_goatbench
 from src.dataset_utils import prepare_goatbench_navigation_goals
-from src.query_vlm import query_vlm_for_response, query_vlm_for_response_end
+from src.query_vlm import query_vlm_for_response, query_vlm_for_response_end, query_vlm_for_response_end_strict
 from src.logger_goatbench import Logger
 import time
 
@@ -181,6 +181,92 @@ def _finish_step_trajectory(
         }
     )
     logger.log_step_trajectory(step_log)
+
+
+def _cfg_get(cfg, name, default):
+    try:
+        return getattr(cfg, name)
+    except Exception:
+        return default
+
+
+def _cfg_list(cfg, name, default):
+    value = _cfg_get(cfg, name, default)
+    if value is None:
+        return []
+    return list(value)
+
+
+def _normalize_text(text):
+    return str(text or "").strip().lower()
+
+
+def _strict_stop_reasons(cfg, subtask_metadata, target_type, cnt_step, num_step):
+    """Decide whether the strict (second-opinion) stop-check should run this step.
+
+    Two-tier logic:
+
+      1. SCOPE (gate) -- `strict_for_task_types` / `strict_for_target_types`.
+         These define *which subtasks are eligible at all*. When a scope is
+         configured and the subtask is outside it, we return [] immediately and
+         the strict check never runs. This keeps strict stopping from leaking
+         into task types it was never meant for (the earlier version OR'd every
+         condition, so a `plant`/`rug` object-task or any step<=min_steps got
+         strict-checked regardless of task type, which regressed object &
+         description success).
+
+      2. REFINEMENTS (within scope) -- `strict_for_min_steps`,
+         `strict_for_early_fraction`, `hard_targets`. These only add reasons for
+         subtasks that already passed the gate; they never expand the scope.
+
+    Backward-compat: if NO scope is configured (both lists empty), the
+    refinements act as the sole triggers, matching the old behaviour.
+    """
+    stop_cfg = _cfg_get(cfg, "stop_check", None)
+    if stop_cfg is None or not _cfg_get(stop_cfg, "enabled", False):
+        return []
+    if not _cfg_get(stop_cfg, "strict_enabled", False):
+        return []
+
+    task_type = _normalize_text(subtask_metadata.get("task_type"))
+    target_type_norm = _normalize_text(target_type)
+    question = _normalize_text(subtask_metadata.get("question"))
+    target_class = _normalize_text(subtask_metadata.get("class"))
+
+    # ---- tier 1: scope gate ----
+    strict_task_types = [_normalize_text(x) for x in _cfg_list(stop_cfg, "strict_for_task_types", [])]
+    strict_target_types = [_normalize_text(x) for x in _cfg_list(stop_cfg, "strict_for_target_types", [])]
+
+    scope_reasons = []
+    if task_type in strict_task_types:
+        scope_reasons.append(f"task_type:{task_type}")
+    if target_type_norm in strict_target_types:
+        scope_reasons.append(f"target_type:{target_type_norm}")
+
+    scope_configured = bool(strict_task_types or strict_target_types)
+    if scope_configured and not scope_reasons:
+        # a scope is set and this subtask is outside it -> never strict-check
+        return []
+
+    reasons = list(scope_reasons)
+
+    # ---- tier 2: refinements (only reached for in-scope subtasks, or when no
+    #      scope is configured at all) ----
+    min_steps = int(_cfg_get(stop_cfg, "strict_for_min_steps", 0) or 0)
+    if min_steps > 0 and cnt_step + 1 <= min_steps:
+        reasons.append(f"early_step:{cnt_step + 1}<={min_steps}")
+
+    early_fraction = float(_cfg_get(stop_cfg, "strict_for_early_fraction", 0.0) or 0.0)
+    if early_fraction > 0 and num_step > 0 and (cnt_step + 1) / num_step <= early_fraction:
+        reasons.append(f"early_fraction:{(cnt_step + 1) / num_step:.2f}<={early_fraction:.2f}")
+
+    hard_targets = [_normalize_text(x) for x in _cfg_list(stop_cfg, "hard_targets", [])]
+    target_text = f"{target_class} {question}"
+    matched_hard_targets = [x for x in hard_targets if x and x in target_text]
+    if matched_hard_targets:
+        reasons.append("hard_target:" + ",".join(sorted(set(matched_hard_targets))))
+
+    return reasons
 
 
 def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
@@ -400,6 +486,14 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             or tsdf_planner.target_point is not None
                         ),
                         "planner_before": _planner_point_summary(tsdf_planner),
+                        "end_check_called": False,
+                        "end_check_response": None,
+                        "strict_stop_check_required": False,
+                        "strict_stop_check_reasons": [],
+                        "strict_stop_check_called": False,
+                        "strict_stop_check_response": None,
+                        "strict_stop_check_reason": "",
+                        "stop_validation_final": None,
                     }
                     his_decision['cnt_step'] = cnt_step
                     his_decision['max_step'] = num_step
@@ -742,6 +836,12 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                                     resize_image(scene.all_observations[obs_file_name], cfg.prompt_h, cfg.prompt_w)
                                 )
                             task_check_obs_frames[global_step - back_step + 1] = task_check_obs.copy()
+                        step_log["stop_check_frames"] = len(task_check_obs_frames)
+                        step_log["stop_candidate"] = {
+                            "target_type": target_type,
+                            "target_index": target_index,
+                            "planner": _planner_point_summary(tsdf_planner),
+                        }
                         vlm_response = query_vlm_for_response_end(
                             subtask_metadata=subtask_metadata,
                             rgb_egocentric_views=task_check_obs_frames,
@@ -752,6 +852,66 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             step_log["end_check_called"] = True
                             step_log["end_check_response"] = vlm_response
                             step_log["events"].append({"event": "end_check_yes"})
+                            strict_reasons = _strict_stop_reasons(
+                                cfg,
+                                subtask_metadata,
+                                target_type,
+                                cnt_step,
+                                num_step,
+                            )
+                            step_log["strict_stop_check_required"] = bool(strict_reasons)
+                            step_log["strict_stop_check_reasons"] = strict_reasons
+                            step_log["strict_stop_check_called"] = False
+                            step_log["strict_stop_check_response"] = None
+                            step_log["strict_stop_check_reason"] = ""
+                            step_log["stop_validation_final"] = "accepted_normal"
+                            if strict_reasons:
+                                strict_response, strict_reason = query_vlm_for_response_end_strict(
+                                    subtask_metadata=subtask_metadata,
+                                    rgb_egocentric_views=task_check_obs_frames,
+                                    cfg=cfg,
+                                    verbose=True,
+                                )
+                                step_log["strict_stop_check_called"] = True
+                                step_log["strict_stop_check_response"] = strict_response
+                                step_log["strict_stop_check_reason"] = strict_reason
+                                if strict_response == "yes":
+                                    step_log["events"].append(
+                                        {
+                                            "event": "strict_end_check_yes",
+                                            "reasons": strict_reasons,
+                                            "reason": strict_reason,
+                                        }
+                                    )
+                                    step_log["stop_validation_final"] = "accepted_strict"
+                                else:
+                                    decision['object_judge'] = "no"
+                                    decision["stop_validation"] = "rejected_strict"
+                                    decision["stop_validation_reasons"] = strict_reasons
+                                    decision["strict_stop_check_response"] = strict_response
+                                    step_log["decision"] = decision.copy()
+                                    step_log["events"].append(
+                                        {
+                                            "event": "strict_end_check_no",
+                                            "reasons": strict_reasons,
+                                            "response": strict_response,
+                                            "reason": strict_reason,
+                                        }
+                                    )
+                                    step_log["stop_validation_final"] = "rejected_strict"
+                                    his_decision[cnt_step] = decision
+                                    step_log["his_decision_step_keys"] = list(his_decision.keys())
+                                    _finish_step_trajectory(
+                                        logger,
+                                        step_log,
+                                        pts,
+                                        angle,
+                                        scene,
+                                        tsdf_planner,
+                                        subtask_metadata,
+                                        target_arrived=target_arrived,
+                                    )
+                                    continue
                             his_decision[cnt_step] = decision
                             _finish_step_trajectory(
                                 logger,
@@ -766,8 +926,13 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             break
                         else:
                             decision['object_judge'] = "no"
+                            decision["stop_validation"] = "rejected_normal"
                             step_log["end_check_called"] = True
                             step_log["end_check_response"] = vlm_response
+                            step_log["strict_stop_check_required"] = False
+                            step_log["strict_stop_check_reasons"] = []
+                            step_log["strict_stop_check_called"] = False
+                            step_log["stop_validation_final"] = "rejected_normal"
                             step_log["decision"] = decision.copy()
                             step_log["events"].append({"event": "end_check_no"})
                     else:

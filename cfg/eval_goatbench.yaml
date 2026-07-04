@@ -75,6 +75,28 @@ hfov: 120
 
 # about goatbench evaluation
 success_distance: 0.25  # the distance threshold for a successful navigation
+stop_check:
+  enabled: true
+  strict_enabled: true
+  # --- SCOPE (gate): only these subtasks are ever strict-checked. ---
+  # Narrowed to image tasks only: strict stopping helped image (+3.4) but
+  # regressed object/description when applied globally, so it is now gated here.
+  strict_for_task_types: ["image"]
+  strict_for_target_types: []
+  # --- REFINEMENTS: only apply *within* the scope above (never expand it). ---
+  # Dormant while scope=image (image already strict-checks every step); kept for
+  # tuning / for runs that widen the scope.
+  strict_for_min_steps: 0
+  strict_for_early_fraction: 0.0
+  hard_targets:
+    - picture
+    - mirror
+    - window
+    - glass
+    - plant
+    - decorative plant
+    - rug
+    - carpet
 clear_up_memory_every_subtask: false
 use_full_obj_list: false
 

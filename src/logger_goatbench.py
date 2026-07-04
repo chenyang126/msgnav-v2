@@ -157,8 +157,10 @@ class Logger:
         self.trajectory_jsonl_path = os.path.join(output_dir, f"trajectory_{_tag}.jsonl")
         self.trajectory_records = []
         self.current_trajectory_meta = {}
-        # accumulate all record dicts of this worker so we can rewrite the csv each time
+        # accumulate record dicts of this worker so we can rewrite the csv each time.
+        # Keep one latest row per subtask_id; JSONL remains one-line-per-subtask.
         self._records = []
+        self._records_by_id = {}
         self._csv_fields = [
             "timestamp", "model", "subtask_id", "scene", "episode", "subtask_idx",
             "task_type", "question", "gt_answer", "success", "spl",
@@ -166,6 +168,20 @@ class Logger:
             "final_distance_to_goal", "n_steps", "n_filtered_frames", "n_total_frames",
             "goal_obj_ids", "note",
         ]
+        if os.path.exists(self.records_jsonl_path):
+            try:
+                with open(self.records_jsonl_path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        record = json.loads(line)
+                        subtask_id = record.get("subtask_id")
+                        if subtask_id:
+                            self._records_by_id[subtask_id] = record
+                self._records = list(self._records_by_id.values())
+            except Exception:
+                logging.warning("Failed to preload existing live records; continuing with an empty live record cache")
 
         # some sanity check
         assert (
@@ -439,16 +455,20 @@ class Logger:
                 "note": note,
             }
 
-            # append to JSONL (one line per subtask, full detail)
-            with open(self.records_jsonl_path, "a") as f:
-                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            # JSONL should be one line per subtask_id. If this process is resuming
+            # from an existing records_*.jsonl, _records_by_id was preloaded above.
+            is_new_record = subtask_id not in self._records_by_id
+            self._records_by_id[subtask_id] = record
+            if is_new_record:
+                with open(self.records_jsonl_path, "a") as f:
+                    f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
 
-            # keep in-memory list and rewrite the flat CSV
-            self._records.append(record)
+            # rewrite the flat CSV with the latest row for each subtask
+            self._records = list(self._records_by_id.values())
             with open(self.records_csv_path, "w", newline="") as f:
                 w = csv.DictWriter(f, fieldnames=self._csv_fields, extrasaction="ignore")
                 w.writeheader()
-                for r in self._records:
+                for r in sorted(self._records, key=lambda x: x.get("subtask_id", "")):
                     row = dict(r)
                     if isinstance(row.get("goal_obj_ids"), (list, tuple)):
                         row["goal_obj_ids"] = ";".join(str(x) for x in row["goal_obj_ids"])

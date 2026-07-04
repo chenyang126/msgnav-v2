@@ -328,7 +328,10 @@ The object cannot be determined from the current information, so I need to furth
             text += f"    step {step} : "
             have_decision = True
             if history_decision[step]['target_type'] == "object":
-                text += f" Choosing Object {history_decision[step]['max_point_choice']} as answer, but not correct.\n"
+                text += f" Choosing Object {history_decision[step]['max_point_choice']} as answer, but not correct."
+                if history_decision[step].get('stop_validation') == "rejected_strict":
+                    text += " It failed strict final visual verification."
+                text += "\n"
             elif history_decision[step]['target_type'] == "image":
                 ID = history_decision[step]['max_point_choice']
                 if ID in image_map:
@@ -468,7 +471,10 @@ The object cannot be determined from the current information, so I need to furth
             text += f"    step {step} : "
             have_decision = True
             if history_decision[step]['target_type'] == "object":
-                text += f" Choosing Object {history_decision[step]['max_point_choice']} as answer, but not correct.\n"
+                text += f" Choosing Object {history_decision[step]['max_point_choice']} as answer, but not correct."
+                if history_decision[step].get('stop_validation') == "rejected_strict":
+                    text += " It failed strict final visual verification."
+                text += "\n"
             elif history_decision[step]['target_type'] == "image":
                 ID = history_decision[step]['max_point_choice']
                 if ID in image_map:
@@ -584,6 +590,46 @@ def format_end_prompt(
     content.append((text,))
     
     return sys_prompt, content
+
+def format_strict_end_prompt(
+    question,
+    egocentric_imgs,
+    image_goal=None,
+):
+
+    sys_prompt = "Task: You are a careful verifier for an indoor navigation agent. Your job is to decide whether the agent has likely reached the target object required by the question.\n"
+
+    content = []
+    text = "Verification rules:\n"
+    text += "Answer Yes when the target object is visible nearby and the observations provide reasonable visual evidence for the requested goal.\n"
+    text += "For image goals, require that the visible object matches the goal image better than nearby alternatives.\n"
+    text += "For description goals, check the distinctive description when it is visually observable; do not reject solely because some relation/context is outside the camera view.\n"
+    text += "Answer No only when the visible evidence points to a clearly different object, the target is not visible, or the match is genuinely ambiguous among multiple candidates.\n"
+    text += "Judge from the observations, not merely from the navigation command.\n"
+    text += f"Here is the Question: {question}"
+    if image_goal is not None:
+        content.append((text, image_goal))
+        content.append(("\n",))
+    else:
+        content.append((text + "\n",))
+
+    steps = list(egocentric_imgs.keys())
+    steps.sort(reverse=True)
+    for step in steps:
+        text = (
+            f"The following are surrounding observations about the egocentric view of the agent at the final {step}-th step : \n"
+        )
+        content.append((text, ))
+        for idx, img in enumerate(egocentric_imgs[step]):
+            content.append((f"    Surrounding observation {idx + 1} ", img))
+            content.append(("\n",))
+
+    text = "Answer: (Yes or No)\n"
+    text += "You can explain the reason for your choice, but put it in a new line after the choice.\n"
+    content.append((text,))
+
+    return sys_prompt, content
+
 
 def format_prefiltering_prompt(question, scene_graph, top_k=10, image_goal=None, room_label = False):
     content = []
@@ -968,6 +1014,66 @@ def task_check(step, verbose=False):
     retry_bound = 3
     final_response = None
     final_reason = None
+    for _ in range(retry_bound):
+        response = call_openai_api(sys_prompt, content)
+        if response is None:
+            print("call_openai_api returns None, retrying")
+            continue
+
+        response = response.strip()
+        if "\n" in response:
+            response = response.split("\n")
+            response, reason = response[0], response[-1]
+        else:
+            reason = ""
+        response = response.lower()
+
+        response_valid = False
+        if response in ["yes", "no"]:
+            response_valid = True
+        elif response.startswith("yes"):
+            response = "yes"
+            response_valid = True
+        elif response.startswith("no"):
+            response = "no"
+            response_valid = True
+
+        if response_valid:
+            final_response = response
+            final_reason = reason
+            break
+
+    return (
+        final_response,
+        final_reason,
+    )
+
+
+def strict_task_check(step, verbose=False):
+    question, image_goal = format_question(step)
+    egocentric_imgs = {}
+    for k in step["egocentric_views"].keys():
+        egocentric_imgs_frame = []
+        for egocentric_view in step["egocentric_views"][k]:
+            egocentric_imgs_frame.append(encode_tensor2base64(egocentric_view))
+        egocentric_imgs[k] = egocentric_imgs_frame.copy()
+    sys_prompt, content = format_strict_end_prompt(
+        question,
+        egocentric_imgs,
+        image_goal=image_goal,
+    )
+    if verbose:
+        logging.info(f"Strict input prompt:")
+        message = sys_prompt
+        for c in content:
+            message += c[0]
+            if len(c) == 2:
+                message += f"[{c[1][:10]}...]"
+        logging.info(message)
+
+    retry_bound = 3
+    final_response = ""
+    final_reason = ""
     for _ in range(retry_bound):
         response = call_openai_api(sys_prompt, content)
         if response is None:

@@ -3,7 +3,7 @@ from typing import Tuple, Optional, Union
 import random
 import numpy as np
 
-from src.explore_utils import task_check, explore_two_step
+from src.explore_utils import task_check, strict_task_check, explore_two_step
 from src.utils import Visibility_based_Viewpoint_Decision
 from src.tsdf_planner import TSDFPlanner, Frontier
 from src.multimodal_3d_scene_graph import Scene
@@ -345,5 +345,33 @@ def query_vlm_for_response_end(
     ) = task_check(step_dict, verbose=verbose)
 
     logging.info(f"Response: [{outputs}]\nReason: [{reason}]")
-    
+
     return outputs
+
+
+def query_vlm_for_response_end_strict(
+    subtask_metadata: dict,
+    rgb_egocentric_views: dict,
+    cfg,
+    verbose: bool = False,
+):
+    # prepare input for vlm
+    step_dict = {}
+    # prepare egocentric views
+    step_dict["egocentric_views"] = rgb_egocentric_views
+    step_dict["use_egocentric_views"] = True
+
+    # prepare other metadata
+    step_dict["question"] = subtask_metadata["question"]
+    step_dict["task_type"] = subtask_metadata["task_type"]
+    step_dict["class"] = subtask_metadata["class"]
+    step_dict["image"] = subtask_metadata["image"]
+    # query vlm
+    (
+        outputs,
+        reason,
+    ) = strict_task_check(step_dict, verbose=verbose)
+
+    logging.info(f"Strict response: [{outputs}]\nStrict reason: [{reason}]")
+
+    return outputs, reason
