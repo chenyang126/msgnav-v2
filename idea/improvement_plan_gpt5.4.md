@@ -287,7 +287,7 @@ score(frontier) =
 建议增加一个脚本：
 
 ```bash
-python analyze_goatbench_records.py results/example_goatbench_gpt-5.4 \
+python analyze_goatbench_records.py results/exp002_stopcheck_strict_gpt-5.4_278subtasks \
   --by-scene --by-object --failure-mode --threshold-sweep
 ```
 

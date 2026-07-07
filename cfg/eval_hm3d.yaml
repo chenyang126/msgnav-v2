@@ -27,7 +27,6 @@ img_sim_threshold: 0.9
 obj_sim_threshold: 0.3
 lang_sim_threshold: 0.3
 weak_sim_rate: 0.8
-dicision_radius: 0.75
 
 
 # about detection model

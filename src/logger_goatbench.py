@@ -630,6 +630,7 @@ class Logger:
             "goal_obj_ids": goal_obj_ids,  # this is a list of obj id, since for object class type, there will be multiple target objects
             "class": goal_category,
             "goal_positions_voxel": goal_positions_voxel,  # also a list of positions for possible multiple objects
+            "goal_positions": goal_positions,  # habitat frame, GT object center(s), for success-by-distance check
             "task_type": goal_type,
             "viewpoints": viewpoints,
             "gt_subtask_explore_dist": gt_subtask_explore_dist,

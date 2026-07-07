@@ -32,6 +32,7 @@ import math
 import time
 import json
 import logging
+import base64
 import matplotlib.pyplot as plt
 
 import open_clip
@@ -43,7 +44,12 @@ from src.tsdf_planner import TSDFPlanner, Frontier
 from src.multimodal_3d_scene_graph import Scene
 from src.utils import resize_image, calc_agent_subtask_distance, get_pts_angle_goatbench
 from src.dataset_utils import prepare_goatbench_navigation_goals
-from src.query_vlm import query_vlm_for_response, query_vlm_for_response_end, query_vlm_for_response_end_strict
+from src.query_vlm import (
+    query_vlm_for_response,
+    query_vlm_for_response_end,
+    query_vlm_for_response_end_strict,
+    query_vlm_same_target_check,
+)
 from src.logger_goatbench import Logger
 import time
 
@@ -201,6 +207,332 @@ def _normalize_text(text):
     return str(text or "").strip().lower()
 
 
+def _load_image_b64(image_path):
+    """Read an image file into a base64 string, for embedding directly into an
+    EpisodeMemory anchor. Anchors must be self-contained (not just a path) --
+    the subtask directory that held the original file gets deleted (see
+    `rm -r ... subtask_id` near the end of the per-subtask loop) once
+    `save_visualization` is off, long before a later subtask might want to
+    compare against this anchor's image.
+    """
+    if not image_path or not os.path.exists(image_path):
+        return None
+    try:
+        with open(image_path, "rb") as f:
+            return base64.b64encode(f.read()).decode("utf-8")
+    except Exception as e:
+        logging.warning(f"EpisodeMemory: failed to read reference image {image_path}: {e}")
+        return None
+
+
+class EpisodeMemory:
+    """Cross-subtask memory anchors within one episode.
+
+    A thin outcome-annotation layer keyed by scene-graph node id: it records
+    the navigation *outcome* (positive/negative), the successful view pose,
+    and the subtask query used for identity disambiguation -- but never the
+    geometry, which is always resolved live from scene.objects[id].bbox.center
+    so a memory hit benefits from the node's continued refinement. Identity is
+    pre-filtered with cheap graph signals (CLIP/room) before any VLM call, and
+    a hit feeds a soft prior into the VLM prompt plus a live-center navigation
+    target rather than hard-overriding the decision.
+    """
+
+    def __init__(self, cfg):
+        self.anchors = {}  # node_id -> list[record dict]
+        mc = _cfg_get(cfg, "episode_memory", None)
+        self.enabled = mc is not None and _cfg_get(mc, "enabled", False)
+        self.spatial_match_radius = float(_cfg_get(mc, "spatial_match_radius", 0.6)) if mc else 0.6
+        self.min_confidence_dist = float(_cfg_get(mc, "min_confidence_dist", 0.20)) if mc else 0.20
+        # ---- behavior flags (see cfg/eval_goatbench.yaml: episode_memory) ----
+        self.record_negatives = bool(_cfg_get(mc, "record_negatives", False)) if mc else False
+        self.record_strict_rejections = bool(_cfg_get(mc, "record_strict_rejections", False)) if mc else False
+        self.surface_negatives_in_prompt = bool(_cfg_get(mc, "surface_negatives_in_prompt", False)) if mc else False
+        self.use_view_pose_bias = bool(_cfg_get(mc, "use_view_pose_bias", False)) if mc else False
+        pf = _cfg_get(mc, "identity_prefilter", None) if mc else None
+        self.pf_enabled = bool(_cfg_get(pf, "enabled", False)) if pf else False
+        self.pf_clip_high = float(_cfg_get(pf, "clip_high", 0.92)) if pf else 0.92
+        self.pf_clip_low = float(_cfg_get(pf, "clip_low", 0.70)) if pf else 0.70
+        self.pf_use_room = bool(_cfg_get(pf, "use_room", False)) if pf else False
+        self.pf_room_conf_min = float(_cfg_get(pf, "room_conf_min", 0.5)) if pf else 0.5
+        self.pf_snapshot_clip = bool(_cfg_get(pf, "snapshot_clip", False)) if pf else False
+        pp = _cfg_get(mc, "prompt_prior", None) if mc else None
+        self.pp_annotate_positive = bool(_cfg_get(pp, "annotate_positive", True)) if pp else False
+        self.pp_memory_block = bool(_cfg_get(pp, "memory_block", True)) if pp else False
+        # VLM-verified identity check result cache, keyed by (subtask_idx, id(anchor)).
+        # query()/annotate_nodes() run every step while a target is active, so without
+        # caching the same anchor would get re-checked by the VLM on every single step
+        # of a subtask instead of once.
+        self._identity_cache = {}
+
+    # ------------------------------------------------------------------
+    # Small helpers shared by the redesigned path
+    # ------------------------------------------------------------------
+    def _live_center(self, scene, node_id):
+        """Current scene-graph center of a node, or None if the node no longer
+        exists (merged/cleared). Geometry is always resolved live -- never from
+        a frozen snapshot -- so a memory hit benefits from the continued
+        refinement of bbox.center as more detections merge in."""
+        try:
+            if scene is not None and isinstance(node_id, int) and node_id in scene.objects:
+                return np.array(scene.objects[node_id]["bbox"].center, dtype=float)
+        except Exception:
+            pass
+        return None
+
+    def _get_clip_ft(self, scene, node_id, anchor=None):
+        """1-D CPU tensor of a node's CLIP feature. Prefer the live node; fall
+        back to the anchor's stored snapshot only if the node is gone."""
+        try:
+            if scene is not None and isinstance(node_id, int) and node_id in scene.objects:
+                ft = scene.objects[node_id].get("clip_ft")
+                if ft is not None:
+                    return torch.as_tensor(ft).detach().float().cpu().reshape(-1)
+        except Exception:
+            pass
+        if anchor is not None and anchor.get("clip_ft") is not None:
+            try:
+                return torch.as_tensor(anchor["clip_ft"]).detach().float().cpu().reshape(-1)
+            except Exception:
+                pass
+        return None
+
+    def _graph_identity_prefilter(self, scene, query_node_id, anchor):
+        """Cheap, VLM-free identity signal between the queried node and an
+        anchor's node, from scene-graph features. Returns "pass" (same
+        instance), "reject" (different instance), or "uncertain" (fall through
+        to the VLM gate). For an exact-id match the CLIP cosine is ~1.0, so the
+        common case resolves here without any VLM call."""
+        if not self.pf_enabled:
+            return "uncertain"
+        verdict = "uncertain"
+        q_ft = self._get_clip_ft(scene, query_node_id)
+        a_ft = self._get_clip_ft(scene, anchor.get("node_id"), anchor=anchor)
+        if q_ft is not None and a_ft is not None and q_ft.shape == a_ft.shape:
+            sim = torch.nn.functional.cosine_similarity(
+                q_ft.unsqueeze(0), a_ft.unsqueeze(0)
+            ).item()
+            if sim >= self.pf_clip_high:
+                verdict = "pass"
+            elif sim <= self.pf_clip_low:
+                return "reject"
+        # room signal: a confident room disagreement pushes an otherwise
+        # "pass" down to "uncertain" (never upgrades, never hard-rejects alone)
+        if self.pf_use_room and verdict == "pass":
+            try:
+                obj = scene.objects.get(query_node_id) if scene is not None else None
+                if obj is not None and anchor.get("room_label"):
+                    q_room = _normalize_text(obj.get("room_label"))
+                    a_room = _normalize_text(anchor.get("room_label"))
+                    q_conf = float(obj.get("room_conf", 0.0) or 0.0)
+                    if q_room and a_room and q_room != a_room and q_conf >= self.pf_room_conf_min:
+                        verdict = "uncertain"
+            except Exception:
+                pass
+        return verdict
+
+    def _identity_ok(self, scene, query_node_id, anchor, task_type,
+                     description, image_b64, subtask_idx):
+        """Unified identity gate: cheap graph pre-filter first, VLM only when
+        genuinely uncertain. "object" task-type queries carry no distinguishing
+        text (fixed template), so they never trigger the VLM -- they are judged
+        on the CLIP/room pre-filter alone (a stricter signal than the legacy
+        unconditional pass)."""
+        verdict = self._graph_identity_prefilter(scene, query_node_id, anchor)
+        if verdict == "pass":
+            return True
+        if verdict == "reject":
+            return False
+        # uncertain
+        if task_type == "object":
+            return True
+        return self._passes_identity_gate(anchor, task_type, description, image_b64, subtask_idx)
+
+    def record(self, scene, node_id, subtask_idx, task_type, target_class,
+               success, final_dist, view_position=None, view_angle=None,
+               outcome=None, neg_reason=None, description=None, image_b64=None):
+        """Record a subtask outcome against a scene-graph node. Stores only what
+        the scene graph lacks -- the navigation outcome, the successful view
+        pose, and the subtask query used for identity disambiguation. Geometry
+        is NOT stored (resolved live at query time)."""
+        if not self.enabled or node_id is None:
+            return
+
+        if outcome is None:
+            outcome = ("positive" if (success and final_dist is not None
+                                      and final_dist <= self.min_confidence_dist)
+                       else "negative")
+        if outcome == "negative" and not self.record_negatives:
+            return
+
+        clip_snapshot = None
+        room_snapshot = None
+        try:
+            if isinstance(node_id, int) and node_id in scene.objects:
+                obj = scene.objects[node_id]
+                room_snapshot = obj.get("room_label")
+                if self.pf_snapshot_clip and obj.get("clip_ft") is not None:
+                    clip_snapshot = torch.as_tensor(obj["clip_ft"]).detach().float().cpu().numpy().copy()
+        except Exception:
+            pass
+
+        record = {
+            "node_id": node_id,
+            "subtask_idx": subtask_idx,
+            "task_type": task_type,
+            "target_class": _normalize_text(target_class),
+            "outcome": outcome,
+            "success": bool(success),
+            "final_dist": (float(final_dist) if final_dist is not None else None),
+            "neg_reason": neg_reason if outcome == "negative" else None,
+            "view_position": (np.array(view_position, dtype=float).copy()
+                              if view_position is not None else None),
+            "view_angle": (float(view_angle) if view_angle is not None else None),
+            "description": description,
+            "image_b64": image_b64,
+            "clip_ft": clip_snapshot,
+            "room_label": room_snapshot,
+        }
+        self.anchors.setdefault(node_id, []).append(record)
+
+    def query(self, scene, target_obj_id, target_class=None, task_type=None,
+              description=None, image_b64=None, subtask_idx=None):
+        """Layered cheap->expensive match returning both a positive hit and any
+        surfaced negatives. All geometry is resolved live from the scene graph.
+
+        Returns:
+            {"positive": {node_id, match, from_subtask, final_dist,
+                          live_center, view_position, view_angle} | None,
+             "negatives": [{node_id, neg_reason, from_subtask, match}, ...]}
+        """
+        if not self.enabled:
+            return {"positive": None, "negatives": []}
+
+        query_class = _normalize_text(target_class)
+        positive = None
+        negatives = []
+
+        def _consider(anchor, node_id, match):
+            nonlocal positive
+            if not self._identity_ok(scene, node_id, anchor, task_type,
+                                     description, image_b64, subtask_idx):
+                return
+            if anchor["outcome"] == "positive":
+                fd = anchor["final_dist"]
+                if fd is None or fd > self.min_confidence_dist:
+                    return
+                if positive is None or fd < positive["final_dist"]:
+                    positive = {
+                        "node_id": node_id,
+                        "match": match,
+                        "from_subtask": anchor["subtask_idx"],
+                        "final_dist": fd,
+                        "live_center": self._live_center(scene, node_id),
+                        "view_position": anchor.get("view_position"),
+                        "view_angle": anchor.get("view_angle"),
+                    }
+            elif self.surface_negatives_in_prompt:
+                negatives.append({
+                    "node_id": node_id,
+                    "neg_reason": anchor.get("neg_reason"),
+                    "from_subtask": anchor["subtask_idx"],
+                    "match": match,
+                })
+
+        # Level 1: exact node-id match (cheapest; CLIP pre-filter ~1.0 -> no VLM)
+        if target_obj_id in self.anchors:
+            for anchor in self.anchors[target_obj_id]:
+                _consider(anchor, target_obj_id, "exact_id")
+
+        # Level 2: spatial proximity using LIVE centers of both nodes
+        q_center = self._live_center(scene, target_obj_id)
+        if q_center is not None:
+            tc_xz = np.array([q_center[0], q_center[2]], dtype=float)
+            for a_node, anchor_list in self.anchors.items():
+                if a_node == target_obj_id:
+                    continue
+                a_center = self._live_center(scene, a_node)
+                if a_center is None:
+                    continue
+                d = np.linalg.norm(np.array([a_center[0], a_center[2]]) - tc_xz)
+                if d >= self.spatial_match_radius:
+                    continue
+                for anchor in anchor_list:
+                    if query_class and anchor["target_class"] != query_class:
+                        continue
+                    _consider(anchor, a_node, "spatial")
+
+        return {"positive": positive, "negatives": negatives}
+
+    def annotate_nodes(self, scene, task_type, target_class, description,
+                       image_b64, subtask_idx):
+        """Build per-node memory hints for the VLM prompt (soft prior), for
+        every recorded node that still exists in the scene graph and passes the
+        identity gate against the current subtask. Called once per step BEFORE
+        the VLM query (the VLM decision precedes query()). Returns
+        {node_id: {"positive", "negative", "from_subtask", "final_dist",
+                   "neg_reason"}}."""
+        hints = {}
+        if not self.enabled:
+            return hints
+        for node_id, anchor_list in self.anchors.items():
+            if not (isinstance(node_id, int) and node_id in scene.objects):
+                continue
+            for anchor in anchor_list:
+                if not self._identity_ok(scene, node_id, anchor, task_type,
+                                         description, image_b64, subtask_idx):
+                    continue
+                h = hints.setdefault(node_id, {"positive": False, "negative": False,
+                                               "from_subtask": None, "final_dist": None,
+                                               "neg_reason": None})
+                if anchor["outcome"] == "positive":
+                    fd = anchor["final_dist"]
+                    if fd is not None and fd <= self.min_confidence_dist:
+                        h["positive"] = True
+                        h["from_subtask"] = anchor["subtask_idx"]
+                        h["final_dist"] = fd
+                elif self.surface_negatives_in_prompt:
+                    h["negative"] = True
+                    h["neg_reason"] = anchor.get("neg_reason")
+                    if h["from_subtask"] is None:
+                        h["from_subtask"] = anchor["subtask_idx"]
+        # drop nodes that ended up with no active hint
+        return {k: v for k, v in hints.items() if v["positive"] or v["negative"]}
+
+    def _passes_identity_gate(self, anchor, task_type, description, image_b64, subtask_idx):
+        """Reject a candidate anchor that looks like a different physical
+        instance than the one currently being queried, per a VLM comparison
+        of the two subtasks' own descriptions/images.
+
+        "object" task-type queries carry no distinguishing info beyond the
+        class name (the question is a fixed template, e.g. "Can you find the
+        mirror?", identical for every mirror in the home) -- asking a VLM to
+        compare two copies of that same generic sentence can't discriminate
+        and risks an arbitrary/hallucinated rejection of a legitimate reuse,
+        so the gate is skipped (passes through) for that task type and this
+        candidate is judged solely on the existing target_obj_id/class/
+        spatial checks, same as before this gate existed.
+
+        Results are cached per (subtask_idx, anchor) since query() is called
+        every step while a target is active -- without this the same anchor
+        would trigger a fresh VLM call on every single step.
+        """
+        if task_type == "object":
+            return True
+        cache_key = (subtask_idx, id(anchor))
+        if cache_key in self._identity_cache:
+            return self._identity_cache[cache_key]
+        same = query_vlm_same_target_check(
+            target_class=anchor.get("target_class"),
+            old_description=anchor.get("description"),
+            new_description=description,
+            old_image=anchor.get("image_b64"),
+            new_image=image_b64,
+        )
+        self._identity_cache[cache_key] = same
+        return same
+
+
 def _strict_stop_reasons(cfg, subtask_metadata, target_type, cnt_step, num_step):
     """Decide whether the strict (second-opinion) stop-check should run this step.
 
@@ -267,6 +599,8 @@ def _strict_stop_reasons(cfg, subtask_metadata, target_type, cnt_step, num_step)
         reasons.append("hard_target:" + ",".join(sorted(set(matched_hard_targets))))
 
     return reasons
+
+
 
 
 def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
@@ -404,6 +738,8 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
 
             logging.info(f"\n\nScene {scene_id} initialization successful!")
 
+            episode_memory = EpisodeMemory(cfg)
+
             # run questions in the scene
             global_step = -1
             for subtask_idx, (goal_type, subtask_goal) in enumerate(
@@ -422,6 +758,15 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                     scene=scene,
                     tsdf_planner=tsdf_planner,
                 )
+                # This subtask's own description/reference image, captured once here
+                # (before this subtask's directory can be deleted) and reused by every
+                # episode_memory.query() call in the step loop below plus the final
+                # episode_memory.record() call -- they're what lets EpisodeMemory tell
+                # apart two different physical instances of the same class (e.g. two
+                # mirrors) that a target_obj_id/spatial match alone would conflate.
+                subtask_image_b64 = None
+                if subtask_metadata.get("task_type") == "image" and subtask_metadata.get("image"):
+                    subtask_image_b64 = _load_image_b64(subtask_metadata["image"])
                 logger.init_trajectory_logging(
                     subtask_id,
                     metadata={
@@ -448,6 +793,14 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                 task_check_obs = []
                 cnt_step = -1
                 n_filtered_frames = 0
+                last_target_index = None
+                last_target_type = None
+                last_target_center = None
+                last_decision_type = None  # type of the MOST RECENT vlm decision (incl. frontier)
+                # EpisodeMemory A/B counters (per subtask)
+                n_memory_positive_hits = 0
+                n_live_center_overrides = 0
+                n_vlm_identity_calls_start = len(episode_memory._identity_cache)
                 his_decision = {}
                 subtask_metadata['CLR'] = his_decision
                 # reset tsdf planner
@@ -663,6 +1016,21 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         # query the VLM for the next navigation point, and the reason for the choice
                         step_log["vlm_called"] = True
 
+                        # Build cross-subtask memory hints (soft prior) for the
+                        # VLM prompt BEFORE the query -- the VLM decision precedes
+                        # episode_memory.query() below, so hints must be prepared here.
+                        subtask_metadata['MEMORY_HINTS'] = episode_memory.annotate_nodes(
+                            scene=scene,
+                            task_type=subtask_metadata.get("task_type"),
+                            target_class=subtask_metadata.get("class"),
+                            description=subtask_metadata.get("question"),
+                            image_b64=subtask_image_b64,
+                            subtask_idx=subtask_idx,
+                        )
+                        step_log["memory_hints"] = {
+                            str(k): v for k, v in subtask_metadata['MEMORY_HINTS'].items()
+                        }
+
                         vlm_response = query_vlm_for_response(
                             subtask_metadata=subtask_metadata,
                             scene=scene,
@@ -693,6 +1061,48 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         target_type, max_point_choice, n_filtered_frames, target_index = vlm_response
                         decision['target_type'] = target_type
                         decision['max_point_choice'] = target_index
+                        last_decision_type = target_type
+                        if target_type in ("object", "image"):
+                            last_target_index = target_index
+                            last_target_type = target_type
+                        # query episode memory: if same target was reached before, use memorized viewpoint
+                        memory_result = None
+                        memory_match = None
+                        if target_type in ("object", "image") and target_index is not None:
+                            # geometry is resolved live inside query(); we still keep
+                            # last_target_center for the record() attribution below.
+                            last_target_center = None
+                            try:
+                                if isinstance(target_index, int) and target_index in scene.objects:
+                                    last_target_center = np.array(scene.objects[target_index]["bbox"].center)
+                                elif max_point_choice is not None:
+                                    last_target_center = np.array(max_point_choice, dtype=float)
+                            except Exception as e:
+                                logging.warning(
+                                    f"Failed to compute target_center for target {target_index} "
+                                    f"(type={target_type}): {e}"
+                                )
+                            memory_result = episode_memory.query(
+                                scene=scene,
+                                target_obj_id=target_index,
+                                target_class=subtask_metadata.get("class"),
+                                task_type=subtask_metadata.get("task_type"),
+                                description=subtask_metadata.get("question"),
+                                image_b64=subtask_image_b64,
+                                subtask_idx=subtask_idx,
+                            )
+                            positive = memory_result.get("positive") if memory_result else None
+                            if positive is not None and positive.get("live_center") is not None:
+                                memory_match = positive["match"]
+                                max_point_choice = np.array(positive["live_center"], dtype=float).copy()
+                                n_live_center_overrides += 1
+                                n_memory_positive_hits += 1
+                                logging.info(
+                                    f"EpisodeMemory hit [{memory_match}]: target {target_index} "
+                                    f"reached in subtask {positive['from_subtask']} "
+                                    f"(dist={positive['final_dist']:.3f}m), using live target center"
+                                )
+                        _mem_neg = memory_result.get("negatives") if memory_result else []
                         step_log.update(
                             {
                                 "target_type": target_type,
@@ -700,6 +1110,15 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                                 "n_filtered_frames": n_filtered_frames,
                                 "max_point_choice": max_point_choice,
                                 "decision": decision.copy(),
+                                "memory_hit": ({"match": memory_match,
+                                                "from_subtask": memory_result["positive"]["from_subtask"],
+                                                "from_dist": memory_result["positive"]["final_dist"]}
+                                               if (memory_result and memory_result.get("positive")) else None),
+                                "memory_negatives": [
+                                    {"node_id": n["node_id"], "neg_reason": n["neg_reason"],
+                                     "from_subtask": n["from_subtask"], "match": n["match"]}
+                                    for n in (_mem_neg or [])
+                                ],
                             }
                         )
                         # set the vlm choice as the navigation target
@@ -901,6 +1320,26 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                                     step_log["stop_validation_final"] = "rejected_strict"
                                     his_decision[cnt_step] = decision
                                     step_log["his_decision_step_keys"] = list(his_decision.keys())
+                                    # cross-subtask negative memory: this node was
+                                    # strict-rejected as the current target. Recorded
+                                    # without a distance bar (negatives don't need one).
+                                    if (episode_memory.record_strict_rejections
+                                            and last_target_index is not None):
+                                        episode_memory.record(
+                                            scene=scene,
+                                            node_id=last_target_index,
+                                            subtask_idx=subtask_idx,
+                                            task_type=subtask_metadata.get("task_type", ""),
+                                            target_class=subtask_metadata.get("class", ""),
+                                            success=False,
+                                            final_dist=None,
+                                            view_position=pts,
+                                            view_angle=angle,
+                                            outcome="negative",
+                                            neg_reason="rejected_strict",
+                                            description=subtask_metadata.get("question"),
+                                            image_b64=subtask_image_b64,
+                                        )
                                     _finish_step_trajectory(
                                         logger,
                                         step_log,
@@ -952,20 +1391,45 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         target_arrived=target_arrived,
                     )
 
-                # calculate the distance to the nearest view point
+                # calculate the distance to the nearest GT target object center
                 agent_subtask_distance = calc_agent_subtask_distance(
-                    pts, subtask_metadata["viewpoints"], scene.pathfinder
+                    pts, subtask_metadata["goal_positions"], scene.pathfinder
                 )
                 if agent_subtask_distance < cfg.success_distance:
                     success_by_distance = True
                     logging.info(
-                        f"Success: agent reached the target viewpoint at distance {agent_subtask_distance}!"
+                        f"Success: agent reached the target object center at distance {agent_subtask_distance}!"
                     )
                 else:
                     success_by_distance = False
                     logging.info(
-                        f"Fail: agent failed to reach the target viewpoint at distance {agent_subtask_distance}!"
+                        f"Fail: agent failed to reach the target object center at distance {agent_subtask_distance}!"
                     )
+
+                # record memory anchor for this subtask.
+                # If the last vlm decision before loop exit was a frontier pick
+                # (i.e. the object/image target was superseded/abandoned and the
+                # agent went back to exploring), last_target_index/last_target_center
+                # refer to a stale target unrelated to the final pts -- do not
+                # attribute this subtask's outcome to that target.
+                if last_decision_type in ("object", "image"):
+                    record_target_id = last_target_index
+                else:
+                    record_target_id = None
+                episode_memory.record(
+                    scene=scene,
+                    node_id=record_target_id,
+                    subtask_idx=subtask_idx,
+                    task_type=subtask_metadata.get("task_type", ""),
+                    target_class=subtask_metadata.get("class", ""),
+                    success=success_by_distance,
+                    final_dist=agent_subtask_distance,
+                    view_position=pts,
+                    view_angle=angle,
+                    neg_reason=(None if success_by_distance else "distance_fail"),
+                    description=subtask_metadata.get("question"),
+                    image_b64=subtask_image_b64,
+                )
 
                 logger.save_trajectory_jsonl(
                     subtask_id,
@@ -977,6 +1441,10 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         "n_total_frames": len(scene.img_to_edge),
                         "n_steps": cnt_step + 1,
                         "explore_dist": logger.subtask_explore_dist,
+                        # EpisodeMemory instrumentation
+                        "n_memory_positive_hits": n_memory_positive_hits,
+                        "n_live_center_overrides": n_live_center_overrides,
+                        "n_vlm_identity_calls": len(episode_memory._identity_cache) - n_vlm_identity_calls_start,
                     },
                 )
 

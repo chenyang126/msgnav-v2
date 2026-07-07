@@ -437,12 +437,12 @@ class TSDFPlanner(TSDFPlannerBase):
         if target_type == "image":
             target_point = self.habitat2voxel(choice)[:2]
             self.max_point = self.habitat2voxel(choice)[:2]
-            self.target_point = get_nearest_true_point(target_point, self.unoccupied)
+            self.target_point = get_nearest_true_point(target_point, self.unoccupied & self.island)
             return True
         elif target_type == "object":
             target_point = self.habitat2voxel(choice)[:2]
             self.max_point = self.habitat2voxel(choice)[:2]
-            self.target_point = get_nearest_true_point(target_point, self.unoccupied)
+            self.target_point = get_nearest_true_point(target_point, self.unoccupied & self.island)
             return True
         elif target_type == "frontier":
             # find the direction into unexplored

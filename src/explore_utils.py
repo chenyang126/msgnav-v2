@@ -215,6 +215,7 @@ def Prompt_with_AVU_and_CLR(
     history_decision = None,
     room_label = False,
     task_type = None,
+    memory_hints = None,
 ):
     # CLR: use decision history to avoid repeating wrong choices
     if history_decision is not None:
@@ -278,6 +279,14 @@ The object cannot be determined from the current information, so I need to furth
         text += f"    {obj['class_name']}: {obj['id']}, ({obj['bbox'].center[0]:.2f}, {obj['bbox'].center[2]:.2f}, {obj['bbox'].center[1]:.2f})"
         if room_label:
             text += f", {obj['room_label']}"
+        # cross-subtask memory soft prior (a hint, not a constraint -- the VLM
+        # may still choose otherwise if current evidence disagrees)
+        if memory_hints and obj['id'] in memory_hints:
+            h = memory_hints[obj['id']]
+            if h.get("positive"):
+                text += "  [previously reached successfully in an earlier subtask]"
+            elif h.get("negative"):
+                text += "  [previously rejected as this target in an earlier subtask]"
         text += "\n"
     if len(selected_objs) == 0:
         text += "    No Objects in the 3D scene graph.\n"
@@ -346,6 +355,18 @@ The object cannot be determined from the current information, so I need to furth
             
 
         content.append((text,))
+    # cross-subtask memory summary block (soft prior; distinct from CLR's
+    # "prohibited" framing -- these are priors the VLM may override)
+    if memory_hints:
+        pos_ids = [i for i, h in memory_hints.items() if h.get("positive")]
+        neg_ids = [i for i, h in memory_hints.items() if h.get("negative") and not h.get("positive")]
+        if pos_ids or neg_ids:
+            text = "Cross-subtask memory (priors from earlier subtasks in this episode; treat as hints, you may still choose otherwise if current evidence disagrees):\n"
+            for i in pos_ids:
+                text += f"    Object {i} was reached successfully before -- prefer it if it matches the current target.\n"
+            for i in neg_ids:
+                text += f"    Object {i} was rejected as a target before -- avoid it unless current evidence clearly supports it.\n"
+            content.append((text,))
     # 6 here is the format of the answer
     text = "Answer: \n"
     text += "You can explain the reason for your choice, but put it in a new line after the choice.\n"
@@ -365,6 +386,7 @@ def Prompt_without_AVU(
     history_decision = None,
     room_label = False,
     task_type = None,
+    memory_hints = None,
 ):
     if history_decision is not None:
         sys_prompt = f"You are an agent in an indoor scene who can observe the environment and explore to find a target object. You must choose an Image or an Object as the answer, in order to find the specified target object within {history_decision['max_step']} steps.\n"
@@ -421,6 +443,14 @@ The object cannot be determined from the current information, so I need to furth
         text += f"    {obj['class_name']}: {obj['id']}, ({obj['bbox'].center[0]:.2f}, {obj['bbox'].center[2]:.2f}, {obj['bbox'].center[1]:.2f})"
         if room_label:
             text += f", {obj['room_label']}"
+        # cross-subtask memory soft prior (a hint, not a constraint -- the VLM
+        # may still choose otherwise if current evidence disagrees)
+        if memory_hints and obj['id'] in memory_hints:
+            h = memory_hints[obj['id']]
+            if h.get("positive"):
+                text += "  [previously reached successfully in an earlier subtask]"
+            elif h.get("negative"):
+                text += "  [previously rejected as this target in an earlier subtask]"
         text += "\n"
     if len(selected_objs) == 0:
         text += "    No Objects in the 3D scene graph.\n"
@@ -489,6 +519,18 @@ The object cannot be determined from the current information, so I need to furth
             
 
         content.append((text,))
+    # cross-subtask memory summary block (soft prior; distinct from CLR's
+    # "prohibited" framing -- these are priors the VLM may override)
+    if memory_hints:
+        pos_ids = [i for i, h in memory_hints.items() if h.get("positive")]
+        neg_ids = [i for i, h in memory_hints.items() if h.get("negative") and not h.get("positive")]
+        if pos_ids or neg_ids:
+            text = "Cross-subtask memory (priors from earlier subtasks in this episode; treat as hints, you may still choose otherwise if current evidence disagrees):\n"
+            for i in pos_ids:
+                text += f"    Object {i} was reached successfully before -- prefer it if it matches the current target.\n"
+            for i in neg_ids:
+                text += f"    Object {i} was rejected as a target before -- avoid it unless current evidence clearly supports it.\n"
+            content.append((text,))
     # 6 here is the format of the answer
     text = "Answer: \n"
     text += "You can explain the reason for your choice, but put it in a new line after the choice.\n"
@@ -864,6 +906,7 @@ def explore_two_step(step, cfg, verbose=False):
     ) = Key_Subgraph_Selection(step, verbose, cfg.use_ollama, use_room_filter)
 
     history_decision = step.get("CLR")
+    memory_hints = step.get("MEMORY_HINTS")
 
     # === Step 3: Prompt formatting based on AVU (with optional CLR) usage ===
     format_func = (
@@ -881,7 +924,8 @@ def explore_two_step(step, cfg, verbose=False):
         image_goal=image_goal,
         history_decision=history_decision,
         room_label=use_room_filter,
-        task_type=task_type
+        task_type=task_type,
+        memory_hints=memory_hints,
     )
 
     # === Step 4: Verbose debug logging ===
@@ -1002,6 +1046,99 @@ def task_check(step, verbose=False):
         image_goal=image_goal,
     )
     
+    if verbose:
+        logging.info(f"Input prompt:")
+        message = sys_prompt
+        for c in content:
+            message += c[0]
+            if len(c) == 2:
+                message += f"[{c[1][:10]}...]"
+        logging.info(message)
+
+    retry_bound = 3
+    final_response = None
+    final_reason = None
+    for _ in range(retry_bound):
+        response = call_openai_api(sys_prompt, content)
+        if response is None:
+            print("call_openai_api returns None, retrying")
+            continue
+
+        response = response.strip()
+        if "\n" in response:
+            response = response.split("\n")
+            response, reason = response[0], response[-1]
+        else:
+            reason = ""
+        response = response.lower()
+
+        response_valid = False
+        if response in ["yes", "no"]:
+            response_valid = True
+        elif response.startswith("yes"):
+            response = "yes"
+            response_valid = True
+        elif response.startswith("no"):
+            response = "no"
+            response_valid = True
+
+        if response_valid:
+            final_response = response
+            final_reason = reason
+            break
+
+    return (
+        final_response,
+        final_reason,
+    )
+
+
+def format_same_target_prompt(
+    target_class,
+    old_description,
+    new_description,
+    old_image=None,
+    new_image=None,
+):
+    sys_prompt = (
+        "Task: You are comparing two navigation goals recorded at different points within "
+        f"the SAME household episode, both aimed at an object of the same category ('{target_class}'). "
+        "Decide whether they refer to the SAME physical object instance, or two DIFFERENT physical "
+        "instances of that category located elsewhere in the same home (e.g. two different mirrors "
+        "in two different rooms).\n"
+    )
+    content = []
+    text = f"Goal A (previously searched for, already successfully reached):\nDescription: {old_description}\n"
+    if old_image is not None:
+        content.append((text, old_image))
+        content.append(("\n",))
+    else:
+        content.append((text + "\n",))
+    text = f"Goal B (currently being searched for):\nDescription: {new_description}\n"
+    if new_image is not None:
+        content.append((text, new_image))
+        content.append(("\n",))
+    else:
+        content.append((text + "\n",))
+    text = "Answer: (Yes or No) -- Yes means Goal A and Goal B are the same physical object instance.\n"
+    text += "You can explain the reason for your choice, but put it in a new line after the choice.\n"
+    content.append((text,))
+
+    return sys_prompt, content
+
+
+def same_target_check(
+    target_class,
+    old_description,
+    new_description,
+    old_image=None,
+    new_image=None,
+    verbose=False,
+):
+    sys_prompt, content = format_same_target_prompt(
+        target_class, old_description, new_description, old_image=old_image, new_image=new_image,
+    )
+
     if verbose:
         logging.info(f"Input prompt:")
         message = sys_prompt

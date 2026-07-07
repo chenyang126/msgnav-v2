@@ -1,6 +1,6 @@
 # General
 seed: 77
-exp_name: "example_goatbench"
+exp_name: "exp007_epmem_redesign"
 
 output_parent_dir: "results"
 scene_dataset_config_path: "/home/chenyang/msgnav-v2/data/scene_datasets/hm3d_v0.2/hm3d_annotated_basis.scene_dataset_config.json"
@@ -26,7 +26,6 @@ img_sim_threshold: 0.9
 obj_sim_threshold: 0.3
 lang_sim_threshold: 0.3
 weak_sim_rate: 0.8
-dicision_radius: 0.75
 # about detection model
 yolo_model_name: yolov8x-world.pt
 sam_model_name: sam_l.pt
@@ -74,9 +73,9 @@ img_height: 1280
 hfov: 120
 
 # about goatbench evaluation
-success_distance: 0.25  # the distance threshold for a successful navigation
+success_distance: 1.0  # the distance threshold to GT object center for a successful navigation
 stop_check:
-  enabled: true
+  enabled: false
   strict_enabled: true
   # --- SCOPE (gate): only these subtasks are ever strict-checked. ---
   # Narrowed to image tasks only: strict stopping helped image (+3.4) but
@@ -99,6 +98,53 @@ stop_check:
     - carpet
 clear_up_memory_every_subtask: false
 use_full_obj_list: false
+episode_memory:
+  enabled: true
+  # Level 2: match if memorized *target object center* (not agent stand point)
+  # is within this of the current target's object center, AND same target_class,
+  # AND that anchor's final_dist <= min_confidence_dist. Radius lowered from 1.5m
+  # after EXP-005 showed cross-category contamination (plant<->vase, mirror<->picture)
+  # caused by comparing agent-offset positions instead of object centers.
+  spatial_match_radius: 0.6
+  # only use success anchors with final_dist < this value. Rescaled proportionally
+  # (80% of success_distance) after success_distance moved from 0.25m (GT viewpoint)
+  # to 1.0m (GT object center) -- final_dist's typical range changed with it. This is
+  # a first-pass estimate; re-tune from the final_dist distribution of a full run.
+  min_confidence_dist: 0.8
+  # identity gate: an exact_id/spatial candidate that shares a task_type with
+  # a distinguishing description/image (i.e. "description" or "image", not
+  # "object" -- see EpisodeMemory._passes_identity_gate) is only accepted if a
+  # VLM call confirms the current subtask's description/image is the SAME
+  # physical object instance as the one recorded when the anchor was made.
+  # Guards against the VLM re-selecting the same scene-graph id (or a
+  # spatially close same-class object) for what is actually a different
+  # physical instance (e.g. two different mirrors in the same episode).
+  #
+  # ---- thin outcome-annotation layer over the scene graph ----
+  # Resolves geometry live from scene.objects[id].bbox.center, pre-filters
+  # identity with CLIP/room before any VLM call, records negatives, and feeds
+  # a soft prior into the VLM prompt instead of hard-overriding its choice.
+  # record confirmed-negative outcomes (distance failures at subtask end)
+  record_negatives: true
+  # also record a negative mid-loop when a target is strict-rejected
+  record_strict_rejections: true
+  # inject a "[previously rejected as this target]" soft annotation into the
+  # VLM prompt for negative nodes (never a hard exclusion)
+  surface_negatives_in_prompt: true
+  # cheap graph-signal identity pre-filter, tried before the VLM identity gate
+  identity_prefilter:
+    enabled: true
+    clip_high: 0.92    # CLIP cosine >= this -> same instance, skip VLM
+    clip_low: 0.70     # CLIP cosine <= this -> different instance, skip VLM
+    use_room: true
+    room_conf_min: 0.5
+    snapshot_clip: false  # store a clip_ft copy at record time (merged-node fallback)
+  # prompt-level soft prior (VLM may still choose otherwise)
+  prompt_prior:
+    annotate_positive: true   # "[previously reached successfully ...]"
+    memory_block: true        # add a summary block after the CLR block
+  # phase-2: bias the planner's approach toward the memorized successful view pose
+  use_view_pose_bias: false
 
 # whether to save visualization (which is slow)
 save_visualization: false ########### "false" to speed up, without visualization
