@@ -1,6 +1,6 @@
 # General
 seed: 77
-exp_name: "exp007_epmem_redesign"
+exp_name: "exp008_epmem_logonly"
 
 output_parent_dir: "results"
 scene_dataset_config_path: "/home/chenyang/msgnav-v2/data/scene_datasets/hm3d_v0.2/hm3d_annotated_basis.scene_dataset_config.json"
@@ -121,16 +121,16 @@ episode_memory:
   # physical instance (e.g. two different mirrors in the same episode).
   #
   # ---- thin outcome-annotation layer over the scene graph ----
-  # Resolves geometry live from scene.objects[id].bbox.center, pre-filters
-  # identity with CLIP/room before any VLM call, records negatives, and feeds
-  # a soft prior into the VLM prompt instead of hard-overriding its choice.
-  # record confirmed-negative outcomes (distance failures at subtask end)
+  # Resolves geometry live from scene.objects[id].bbox.center and pre-filters
+  # identity with CLIP/room before any VLM call. Default behavior is log-only:
+  # anchors/candidates are recorded for analysis without prompt or navigation
+  # intervention unless the explicit knobs below are enabled.
+  # keep negative outcomes for analysis, but do not surface them into prompts by default
   record_negatives: true
   # also record a negative mid-loop when a target is strict-rejected
   record_strict_rejections: true
-  # inject a "[previously rejected as this target]" soft annotation into the
-  # VLM prompt for negative nodes (never a hard exclusion)
-  surface_negatives_in_prompt: true
+  # log-only default: prompt-side negative memory hurt image subtasks in EXP-007
+  surface_negatives_in_prompt: false
   # cheap graph-signal identity pre-filter, tried before the VLM identity gate
   identity_prefilter:
     enabled: true
@@ -139,10 +139,19 @@ episode_memory:
     use_room: true
     room_conf_min: 0.5
     snapshot_clip: false  # store a clip_ft copy at record time (merged-node fallback)
-  # prompt-level soft prior (VLM may still choose otherwise)
+  # prompt-level memory prior. Disabled by default after EXP-007 showed broad
+  # prompt hints had negative net effect; enable only for controlled ablations.
   prompt_prior:
-    annotate_positive: true   # "[previously reached successfully ...]"
-    memory_block: true        # add a summary block after the CLR block
+    annotate_positive: false
+    memory_block: false
+  # opt-in navigation fallback. Disabled by default; when enabled, only repeated
+  # exact-id positives with multiple prior successful subtasks can override the
+  # VLM-selected navigation point.
+  live_center_fallback:
+    enabled: false
+    allow_match_types: ["exact_id"]
+    min_distinct_positive_subtasks: 2
+    allowed_task_types: []
   # phase-2: bias the planner's approach toward the memorized successful view pose
   use_view_pose_bias: false
 

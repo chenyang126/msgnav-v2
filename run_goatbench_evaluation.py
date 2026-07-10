@@ -230,12 +230,12 @@ class EpisodeMemory:
 
     A thin outcome-annotation layer keyed by scene-graph node id: it records
     the navigation *outcome* (positive/negative), the successful view pose,
-    and the subtask query used for identity disambiguation -- but never the
-    geometry, which is always resolved live from scene.objects[id].bbox.center
-    so a memory hit benefits from the node's continued refinement. Identity is
-    pre-filtered with cheap graph signals (CLIP/room) before any VLM call, and
-    a hit feeds a soft prior into the VLM prompt plus a live-center navigation
-    target rather than hard-overriding the decision.
+    and the subtask query used for identity disambiguation. Geometry is always
+    resolved live from scene.objects[id].bbox.center when a candidate is queried,
+    but EpisodeMemory is observational by default: prompt hints and live-center
+    navigation fallback are disabled unless explicit config knobs enable them.
+    Identity is pre-filtered with cheap graph signals (CLIP/room) before any VLM
+    same-target check.
     """
 
     def __init__(self, cfg):
@@ -259,6 +259,13 @@ class EpisodeMemory:
         pp = _cfg_get(mc, "prompt_prior", None) if mc else None
         self.pp_annotate_positive = bool(_cfg_get(pp, "annotate_positive", True)) if pp else False
         self.pp_memory_block = bool(_cfg_get(pp, "memory_block", True)) if pp else False
+        lf = _cfg_get(mc, "live_center_fallback", None) if mc else None
+        self.lcf_enabled = bool(_cfg_get(lf, "enabled", False)) if lf else False
+        self.lcf_allow_match_types = set(_cfg_list(lf, "allow_match_types", ["exact_id"])) if lf else {"exact_id"}
+        self.lcf_min_distinct_positive_subtasks = int(_cfg_get(lf, "min_distinct_positive_subtasks", 2)) if lf else 2
+        self.lcf_allowed_task_types = {
+            _normalize_text(x) for x in _cfg_list(lf, "allowed_task_types", [])
+        } if lf else set()
         # VLM-verified identity check result cache, keyed by (subtask_idx, id(anchor)).
         # query()/annotate_nodes() run every step while a target is active, so without
         # caching the same anchor would get re-checked by the VLM on every single step
@@ -395,6 +402,36 @@ class EpisodeMemory:
         }
         self.anchors.setdefault(node_id, []).append(record)
 
+    def _count_distinct_positive_subtasks(self, node_id):
+        """Number of distinct previous subtasks that produced a confident
+        positive anchor for this scene-graph node."""
+        positive_subtasks = set()
+        for anchor in self.anchors.get(node_id, []):
+            if anchor.get("outcome") != "positive":
+                continue
+            fd = anchor.get("final_dist")
+            if fd is not None and fd <= self.min_confidence_dist:
+                positive_subtasks.add(anchor.get("subtask_idx"))
+        return len(positive_subtasks)
+
+    def _should_apply_live_center_fallback(self, positive, task_type):
+        """Conservative opt-in gate for memory-driven navigation changes.
+
+        By default EpisodeMemory is observational: it records/query/logs memory
+        candidates but does not change the VLM-selected navigation point. This
+        gate is intentionally narrow for experiments that want to test repeated
+        exact-id fallback without broad prompt/geometry side effects.
+        """
+        if not self.lcf_enabled or positive is None:
+            return False
+        if positive.get("live_center") is None:
+            return False
+        if positive.get("match") not in self.lcf_allow_match_types:
+            return False
+        if self.lcf_allowed_task_types and _normalize_text(task_type) not in self.lcf_allowed_task_types:
+            return False
+        return int(positive.get("n_prior_positive_subtasks", 0)) >= self.lcf_min_distinct_positive_subtasks
+
     def query(self, scene, target_obj_id, target_class=None, task_type=None,
               description=None, image_b64=None, subtask_idx=None):
         """Layered cheap->expensive match returning both a positive hit and any
@@ -421,6 +458,7 @@ class EpisodeMemory:
                 fd = anchor["final_dist"]
                 if fd is None or fd > self.min_confidence_dist:
                     return
+                n_prior_positive_subtasks = self._count_distinct_positive_subtasks(node_id)
                 if positive is None or fd < positive["final_dist"]:
                     positive = {
                         "node_id": node_id,
@@ -430,6 +468,7 @@ class EpisodeMemory:
                         "live_center": self._live_center(scene, node_id),
                         "view_position": anchor.get("view_position"),
                         "view_angle": anchor.get("view_angle"),
+                        "n_prior_positive_subtasks": n_prior_positive_subtasks,
                     }
             elif self.surface_negatives_in_prompt:
                 negatives.append({
@@ -473,7 +512,9 @@ class EpisodeMemory:
         {node_id: {"positive", "negative", "from_subtask", "final_dist",
                    "neg_reason"}}."""
         hints = {}
-        if not self.enabled:
+        if not self.enabled or not (
+            self.pp_annotate_positive or self.surface_negatives_in_prompt
+        ):
             return hints
         for node_id, anchor_list in self.anchors.items():
             if not (isinstance(node_id, int) and node_id in scene.objects):
@@ -485,7 +526,7 @@ class EpisodeMemory:
                 h = hints.setdefault(node_id, {"positive": False, "negative": False,
                                                "from_subtask": None, "final_dist": None,
                                                "neg_reason": None})
-                if anchor["outcome"] == "positive":
+                if anchor["outcome"] == "positive" and self.pp_annotate_positive:
                     fd = anchor["final_dist"]
                     if fd is not None and fd <= self.min_confidence_dist:
                         h["positive"] = True
@@ -797,9 +838,12 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                 last_target_type = None
                 last_target_center = None
                 last_decision_type = None  # type of the MOST RECENT vlm decision (incl. frontier)
-                # EpisodeMemory A/B counters (per subtask)
-                n_memory_positive_hits = 0
-                n_live_center_overrides = 0
+                # EpisodeMemory counters (per subtask): candidates are log-only by
+                # default; live-center fallback is an explicit opt-in intervention.
+                n_memory_positive_candidates = 0
+                n_memory_fallback_applied = 0
+                n_memory_positive_hits = 0  # backward-compatible alias: candidates
+                n_live_center_overrides = 0  # backward-compatible alias: applied fallback
                 n_vlm_identity_calls_start = len(episode_memory._identity_cache)
                 his_decision = {}
                 subtask_metadata['CLR'] = his_decision
@@ -1031,6 +1075,13 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             str(k): v for k, v in subtask_metadata['MEMORY_HINTS'].items()
                         }
 
+                        subtask_metadata['MEMORY_HINT_POLICY'] = {
+                            "annotate_positive": episode_memory.pp_annotate_positive,
+                            "surface_negatives": episode_memory.surface_negatives_in_prompt,
+                            "memory_block": episode_memory.pp_memory_block,
+                        }
+                        step_log["memory_hint_policy"] = subtask_metadata['MEMORY_HINT_POLICY']
+
                         vlm_response = query_vlm_for_response(
                             subtask_metadata=subtask_metadata,
                             scene=scene,
@@ -1065,9 +1116,12 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         if target_type in ("object", "image"):
                             last_target_index = target_index
                             last_target_type = target_type
-                        # query episode memory: if same target was reached before, use memorized viewpoint
+                        # query episode memory after the VLM choice. By default this
+                        # is log-only; live-center fallback is applied only when an
+                        # explicit conservative config gate allows it.
                         memory_result = None
                         memory_match = None
+                        memory_fallback_applied = False
                         if target_type in ("object", "image") and target_index is not None:
                             # geometry is resolved live inside query(); we still keep
                             # last_target_center for the record() attribution below.
@@ -1092,27 +1146,72 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                                 subtask_idx=subtask_idx,
                             )
                             positive = memory_result.get("positive") if memory_result else None
-                            if positive is not None and positive.get("live_center") is not None:
+                            memory_fallback_applied = False
+                            if positive is not None:
                                 memory_match = positive["match"]
-                                max_point_choice = np.array(positive["live_center"], dtype=float).copy()
-                                n_live_center_overrides += 1
+                                n_memory_positive_candidates += 1
                                 n_memory_positive_hits += 1
-                                logging.info(
-                                    f"EpisodeMemory hit [{memory_match}]: target {target_index} "
-                                    f"reached in subtask {positive['from_subtask']} "
-                                    f"(dist={positive['final_dist']:.3f}m), using live target center"
-                                )
+                                if episode_memory._should_apply_live_center_fallback(
+                                    positive, subtask_metadata.get("task_type")
+                                ):
+                                    max_point_choice = np.array(positive["live_center"], dtype=float).copy()
+                                    memory_fallback_applied = True
+                                    n_memory_fallback_applied += 1
+                                    n_live_center_overrides += 1
+                                    logging.info(
+                                        f"EpisodeMemory fallback applied [{memory_match}]: target {target_index} "
+                                        f"reached in subtask {positive['from_subtask']} "
+                                        f"(dist={positive['final_dist']:.3f}m, "
+                                        f"n_prior={positive.get('n_prior_positive_subtasks', 0)}), using live target center"
+                                    )
+                                else:
+                                    logging.info(
+                                        f"EpisodeMemory candidate [{memory_match}]: target {target_index} "
+                                        f"reached in subtask {positive['from_subtask']} "
+                                        f"(dist={positive['final_dist']:.3f}m, "
+                                        f"n_prior={positive.get('n_prior_positive_subtasks', 0)}), log-only"
+                                    )
                         _mem_neg = memory_result.get("negatives") if memory_result else []
+                        # Instrumentation (data_analysis §1.2): tell "abandoned a reached
+                        # GT" apart from "passed by GT while committed to a wrong instance".
+                        # target_obj_ids_estimate = scene-graph detections mapped to any GT
+                        # obj id this step; committed target is target_index (int obj id for
+                        # object/description; a "<n>-view_*.png" string for image).
+                        gt_perceived_now = len(target_obj_ids_estimate) > 0
+                        if not gt_perceived_now:
+                            committed_target_is_gt = None  # GT not in scene graph yet
+                        elif isinstance(target_index, int):
+                            committed_target_is_gt = target_index in target_obj_ids_estimate
+                        else:
+                            # image target: no obj id to compare -> proximity of the chosen
+                            # nav point to any GT-mapped detection center (success_distance bar)
+                            committed_target_is_gt = None
+                            try:
+                                if max_point_choice is not None:
+                                    mpc = np.array(max_point_choice, dtype=float)
+                                    committed_target_is_gt = any(
+                                        det_id in scene.objects
+                                        and np.linalg.norm(
+                                            np.array(scene.objects[det_id]["bbox"].center, dtype=float) - mpc
+                                        ) <= cfg.success_distance
+                                        for det_id in target_obj_ids_estimate
+                                    )
+                            except Exception:
+                                pass
                         step_log.update(
                             {
                                 "target_type": target_type,
                                 "target_index": target_index,
                                 "n_filtered_frames": n_filtered_frames,
                                 "max_point_choice": max_point_choice,
+                                "gt_perceived_now": gt_perceived_now,
+                                "committed_target_is_gt": committed_target_is_gt,
                                 "decision": decision.copy(),
                                 "memory_hit": ({"match": memory_match,
                                                 "from_subtask": memory_result["positive"]["from_subtask"],
-                                                "from_dist": memory_result["positive"]["final_dist"]}
+                                                "from_dist": memory_result["positive"]["final_dist"],
+                                                "n_prior_positive_subtasks": memory_result["positive"].get("n_prior_positive_subtasks"),
+                                                "fallback_applied": memory_fallback_applied}
                                                if (memory_result and memory_result.get("positive")) else None),
                                 "memory_negatives": [
                                     {"node_id": n["node_id"], "neg_reason": n["neg_reason"],
@@ -1242,6 +1341,8 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                     timer.print_summary(logging)
                     # (6) Check if the agent has arrived at the target to finish the question
                     # Final verification: use VLM to confirm the reached target
+
+                    stop_target_type = target_type
                     if target_type != "frontier" and target_arrived:
                         back_frames = min(cnt_step + 1, cfg.frames_to_check)
                         task_check_obs_frames = {}
@@ -1266,7 +1367,7 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             rgb_egocentric_views=task_check_obs_frames,
                             cfg=cfg,
                             verbose=True,
-                        ) 
+                        )
                         if (vlm_response == 'yes'):
                             step_log["end_check_called"] = True
                             step_log["end_check_response"] = vlm_response
@@ -1274,7 +1375,7 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                             strict_reasons = _strict_stop_reasons(
                                 cfg,
                                 subtask_metadata,
-                                target_type,
+                                stop_target_type,
                                 cnt_step,
                                 num_step,
                             )
@@ -1323,8 +1424,7 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                                     # cross-subtask negative memory: this node was
                                     # strict-rejected as the current target. Recorded
                                     # without a distance bar (negatives don't need one).
-                                    if (episode_memory.record_strict_rejections
-                                            and last_target_index is not None):
+                                    if episode_memory.record_strict_rejections and last_target_index is not None:
                                         episode_memory.record(
                                             scene=scene,
                                             node_id=last_target_index,
@@ -1442,6 +1542,8 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0, split=1, specific = None):
                         "n_steps": cnt_step + 1,
                         "explore_dist": logger.subtask_explore_dist,
                         # EpisodeMemory instrumentation
+                        "n_memory_positive_candidates": n_memory_positive_candidates,
+                        "n_memory_fallback_applied": n_memory_fallback_applied,
                         "n_memory_positive_hits": n_memory_positive_hits,
                         "n_live_center_overrides": n_live_center_overrides,
                         "n_vlm_identity_calls": len(episode_memory._identity_cache) - n_vlm_identity_calls_start,

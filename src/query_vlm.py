@@ -69,6 +69,7 @@ def query_vlm_for_response(
     step_dict["image"] = subtask_metadata["image"]
     step_dict["CLR"] = subtask_metadata['CLR']
     step_dict["MEMORY_HINTS"] = subtask_metadata.get("MEMORY_HINTS")
+    step_dict["MEMORY_HINT_POLICY"] = subtask_metadata.get("MEMORY_HINT_POLICY")
     step_dict["object_id_to_room"] = object_id_to_room
     step_dict['image_to_edges'] = scene.img_to_edge
     # query vlm

@@ -216,6 +216,7 @@ def Prompt_with_AVU_and_CLR(
     room_label = False,
     task_type = None,
     memory_hints = None,
+    memory_policy = None,
 ):
     # CLR: use decision history to avoid repeating wrong choices
     if history_decision is not None:
@@ -283,9 +284,11 @@ The object cannot be determined from the current information, so I need to furth
         # may still choose otherwise if current evidence disagrees)
         if memory_hints and obj['id'] in memory_hints:
             h = memory_hints[obj['id']]
-            if h.get("positive"):
+            annotate_positive = bool((memory_policy or {}).get("annotate_positive", True))
+            surface_negatives = bool((memory_policy or {}).get("surface_negatives", True))
+            if h.get("positive") and annotate_positive:
                 text += "  [previously reached successfully in an earlier subtask]"
-            elif h.get("negative"):
+            elif h.get("negative") and surface_negatives:
                 text += "  [previously rejected as this target in an earlier subtask]"
         text += "\n"
     if len(selected_objs) == 0:
@@ -357,7 +360,7 @@ The object cannot be determined from the current information, so I need to furth
         content.append((text,))
     # cross-subtask memory summary block (soft prior; distinct from CLR's
     # "prohibited" framing -- these are priors the VLM may override)
-    if memory_hints:
+    if memory_hints and bool((memory_policy or {}).get("memory_block", True)):
         pos_ids = [i for i, h in memory_hints.items() if h.get("positive")]
         neg_ids = [i for i, h in memory_hints.items() if h.get("negative") and not h.get("positive")]
         if pos_ids or neg_ids:
@@ -387,6 +390,7 @@ def Prompt_without_AVU(
     room_label = False,
     task_type = None,
     memory_hints = None,
+    memory_policy = None,
 ):
     if history_decision is not None:
         sys_prompt = f"You are an agent in an indoor scene who can observe the environment and explore to find a target object. You must choose an Image or an Object as the answer, in order to find the specified target object within {history_decision['max_step']} steps.\n"
@@ -447,9 +451,11 @@ The object cannot be determined from the current information, so I need to furth
         # may still choose otherwise if current evidence disagrees)
         if memory_hints and obj['id'] in memory_hints:
             h = memory_hints[obj['id']]
-            if h.get("positive"):
+            annotate_positive = bool((memory_policy or {}).get("annotate_positive", True))
+            surface_negatives = bool((memory_policy or {}).get("surface_negatives", True))
+            if h.get("positive") and annotate_positive:
                 text += "  [previously reached successfully in an earlier subtask]"
-            elif h.get("negative"):
+            elif h.get("negative") and surface_negatives:
                 text += "  [previously rejected as this target in an earlier subtask]"
         text += "\n"
     if len(selected_objs) == 0:
@@ -521,7 +527,7 @@ The object cannot be determined from the current information, so I need to furth
         content.append((text,))
     # cross-subtask memory summary block (soft prior; distinct from CLR's
     # "prohibited" framing -- these are priors the VLM may override)
-    if memory_hints:
+    if memory_hints and bool((memory_policy or {}).get("memory_block", True)):
         pos_ids = [i for i, h in memory_hints.items() if h.get("positive")]
         neg_ids = [i for i, h in memory_hints.items() if h.get("negative") and not h.get("positive")]
         if pos_ids or neg_ids:
@@ -907,6 +913,7 @@ def explore_two_step(step, cfg, verbose=False):
 
     history_decision = step.get("CLR")
     memory_hints = step.get("MEMORY_HINTS")
+    memory_policy = step.get("MEMORY_HINT_POLICY") or {}
 
     # === Step 3: Prompt formatting based on AVU (with optional CLR) usage ===
     format_func = (
@@ -926,6 +933,7 @@ def explore_two_step(step, cfg, verbose=False):
         room_label=use_room_filter,
         task_type=task_type,
         memory_hints=memory_hints,
+        memory_policy=memory_policy,
     )
 
     # === Step 4: Verbose debug logging ===
